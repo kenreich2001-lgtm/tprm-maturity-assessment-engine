@@ -3,5 +3,11 @@
 @tailwind utilities;
 
 body {
-  @apply bg-slate-50 text-slate-800 min-h-screen;
+  @apply bg-slate-50 text-slate-800 min-h-screen font-sans antialiased text-[15px] leading-relaxed;
+  font-feature-settings: "kern" 1, "liga" 1;
+  text-rendering: optimizeLegibility;
+}
+
+#root {
+  isolation: isolate;
 }

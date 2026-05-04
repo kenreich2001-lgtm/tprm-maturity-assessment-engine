@@ -80,7 +80,7 @@ const SCORE_LABELS = {
   5: "Optimized",
 };
 
-/** Industry benchmark per domain (static overlay for demo) */
+/** Industry benchmark per domain (static reference overlay) */
 const BENCHMARK_SCORE = 3.5;
 
 const EVIDENCE_WEIGHT = { Weak: 0, Moderate: 0.15, Strong: 0.25 };
@@ -635,6 +635,18 @@ function mockEvidenceSuggestion(domain, row, clientProfile, assessmentType, supp
     missingEvidence,
     _meta: { source: "mock", assessmentType, clientProfile },
   });
+}
+
+/** Build per-domain AI suggestion payloads for demo load (reuses mock analyzer output shape). */
+function buildDemoAiSuggestionsFromWorkspace(profile, assessmentType, rows, supportingText) {
+  const out = {};
+  const clientProfile = buildClientProfileForAi(profile, assessmentType);
+  for (const d of DOMAINS) {
+    const row = rows[d.id];
+    const suggestion = mockEvidenceSuggestion(d, row, clientProfile, assessmentType, supportingText);
+    out[d.id] = { status: "Suggested", suggestion, source: "mock" };
+  }
+  return out;
 }
 
 async function analyzeDomainEvidenceWithLlm({
@@ -1626,6 +1638,122 @@ function initialDomainRows() {
   return o;
 }
 
+const DEMO_ASSESSMENT_PROFILE = {
+  clientName: "Summit Metropolitan Financial Group",
+  industry: "Financial Services",
+  companySize: "Enterprise",
+  regulatoryIntensity: "Very High",
+  thirdPartyVolume: "Very High",
+  geographicFootprint: "Regional",
+};
+
+const DEMO_ASSESSMENT_TYPE = "Full maturity assessment";
+
+const DEMO_SCOPE_NOTES =
+  "FY26 enterprise TPRM cycle covering Tier-1 material outsourcers, critical SaaS concentration, payment processor resilience, and cross-border data flows for retail and commercial banking.";
+
+const DEMO_SUPPORTING_TEXT = `Board-approved third-party risk appetite statement (FY26) and concentration limits. Enterprise vendor inventory reconciled Q4: 412 active vendors; 38 Tier-1 / material relationships identified across legal entities.
+Recent regulatory dialogue referenced cloud service provider concentration and incomplete exit / transition planning for two legacy payment processors.
+Artifacts on file: vendor risk committee minutes (redacted), SOC 2 Type II summaries for the top five processors, integrated resilience test outcomes, and enterprise issue-management aging (90-day roll-up).`;
+
+/** Realistic per-domain scores, evidence strength, and assessor notes for the demo workspace. */
+const DEMO_DOMAIN_SEED = [
+  {
+    id: "governance",
+    score: 3,
+    evidence: "Moderate",
+    notes:
+      "TPRM steering forum meets quarterly; charter exists but board reporting packs vary in depth by quarter. Exception governance is documented; two business units show waiver aging beyond policy SLAs.",
+    recommendationDraft: "",
+  },
+  {
+    id: "inventory",
+    score: 2,
+    evidence: "Weak",
+    notes:
+      "Golden vendor record initiative underway; legal-entity / vendor-ID mismatches persist after acquisitions. Dormant vendor detection runs monthly but closure discipline is uneven across regions.",
+    recommendationDraft: "",
+  },
+  {
+    id: "segmentation",
+    score: 3,
+    evidence: "Moderate",
+    notes:
+      "Tiering criteria published and mapped to diligence depth. Residual risk linkage is improving but not consistently enforced for fast-growing SaaS vendors added via shadow IT channels.",
+    recommendationDraft: "",
+  },
+  {
+    id: "dueDiligence",
+    score: 2,
+    evidence: "Moderate",
+    notes:
+      "Tier-standard diligence packages exist; QA sampling for onboarding files shows inconsistent depth for non-US entities. Cyber sub-assessments sometimes lag contract execution.",
+    recommendationDraft: "",
+  },
+  {
+    id: "contracting",
+    score: 4,
+    evidence: "Strong",
+    notes:
+      "Security and resilience clauses aligned to tier for most Tier-1 contracts; enterprise clause library refreshed annually. Subsidiary addenda occasionally lag template updates by one release.",
+    recommendationDraft: "",
+  },
+  {
+    id: "monitoring",
+    score: 3,
+    evidence: "Moderate",
+    notes:
+      "KRIs and attestations in place for Tier-1; monitoring cadence slips for lower tiers during peak procurement cycles. Automated connectors cover ~60% of critical vendors.",
+    recommendationDraft: "",
+  },
+  {
+    id: "issues",
+    score: 2,
+    evidence: "Weak",
+    notes:
+      "Issue lifecycle documented; validation of closure evidence is inconsistent for Sev-2 items. Linkage from monitoring alerts into formal issues is manual for two core platforms.",
+    recommendationDraft: "",
+  },
+  {
+    id: "reporting",
+    score: 3,
+    evidence: "Moderate",
+    notes:
+      "Management MI pack reviewed monthly; board deck narrative quality improved. Audit trail for tier changes is partial—some decisions captured only in email threads.",
+    recommendationDraft: "",
+  },
+  {
+    id: "technology",
+    score: 4,
+    evidence: "Moderate",
+    notes:
+      "Workflow tooling deployed for Tier-1 lifecycle; API integrations to CMDB and GRC progressing. Data lineage for vendor attributes still fragmented between procurement and risk systems.",
+    recommendationDraft: "",
+  },
+  {
+    id: "regulatory",
+    score: 3,
+    evidence: "Strong",
+    notes:
+      "Supervisory expectations mapped to control owners; jurisdictional nuance documented for primary markets. Evidence packs for exams are strong but assembly time remains high.",
+    recommendationDraft: "",
+  },
+];
+
+function buildDemoDomainRows() {
+  const o = initialDomainRows();
+  for (const e of DEMO_DOMAIN_SEED) {
+    const ev = ["Weak", "Moderate", "Strong"].includes(e.evidence) ? e.evidence : "Moderate";
+    o[e.id] = {
+      score: clampScore(e.score),
+      evidence: ev,
+      notes: typeof e.notes === "string" ? e.notes : "",
+      recommendationDraft: typeof e.recommendationDraft === "string" ? e.recommendationDraft : "",
+    };
+  }
+  return o;
+}
+
 const defaultProfile = {
   clientName: "",
   industry: "Financial Services",
@@ -1754,8 +1882,8 @@ function mergeLoadedLibrarySuggestions(raw) {
 }
 
 const NAV_ITEMS = [
-  { id: "assessment", label: "Assessment" },
   { id: "commandCenter", label: "Command Center" },
+  { id: "assessment", label: "Assessment" },
   { id: "results", label: "Results" },
   { id: "analytics", label: "Visual Analytics" },
   { id: "library", label: "Library" },
@@ -2308,12 +2436,191 @@ function CommandCenterPageContent({
     border: done ? "none" : "1px solid #cbd5e1",
   });
 
+  const aiStage = model.stages.find((s) => s.key === "ai");
+  const qaStage = model.stages.find((s) => s.key === "qa");
+  const aiReviewed = Boolean(aiStage?.done);
+  const qaComplete = Boolean(qaStage?.done);
+
+  const riskVisual =
+    liveAssessment.maturityTier === "Low"
+      ? {
+          headline: "Elevated exposure",
+          sub: "Low program maturity — prioritize weakest domains and evidence depth.",
+          accent: "#b91c1c",
+          rail: "#fecaca",
+          fill: "#fef2f2",
+          chip: "High priority",
+          chipBg: "#fee2e2",
+        }
+      : liveAssessment.maturityTier === "Moderate"
+        ? {
+            headline: "Moderate exposure",
+            sub: "Mixed maturity — tighten monitoring and close gaps in Tier-1 vendors.",
+            accent: "#c2410c",
+            rail: "#fed7aa",
+            fill: "#fffbeb",
+            chip: "Watch",
+            chipBg: "#ffedd5",
+          }
+        : {
+            headline: "Controlled posture",
+            sub: "Stronger mean maturity — sustain automation and peer benchmarking.",
+            accent: "#047857",
+            rail: "#a7f3d0",
+            fill: "#ecfdf5",
+            chip: "Stable",
+            chipBg: "#d1fae5",
+          };
+
+  const glanceCard = {
+    borderRadius: 16,
+    padding: "18px 16px",
+    border: `1px solid ${C.border}`,
+    background: C.surface,
+    boxShadow: "0 4px 18px rgba(15,23,42,0.06)",
+    minHeight: 148,
+    display: "flex",
+    flexDirection: "column",
+  };
+
   return (
     <>
       <SectionCard
         title="Engagement Command Center"
         subtitle="Leadership view of assessment progress, risk posture, AI review, QA, and export readiness."
       >
+        <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.12em", color: C.muted, marginBottom: 12 }}>
+          AT A GLANCE
+        </div>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+            gap: 16,
+            marginBottom: 24,
+          }}
+        >
+          <div style={{ ...glanceCard, borderTop: `4px solid ${C.accent}` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.muted }}>Overall maturity score</div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 6, marginTop: 8 }}>
+              <span style={{ fontSize: 40, fontWeight: 900, letterSpacing: "-0.03em", color: C.text }}>
+                {liveAssessment.overallScore}
+              </span>
+              <span style={{ fontSize: 18, fontWeight: 700, color: C.muted }}>/ 5</span>
+            </div>
+            <div style={{ fontSize: 13, color: C.text, marginTop: 6, fontWeight: 600 }}>
+              {liveAssessment.maturityBand}
+            </div>
+            <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>{liveAssessment.maturityTier} tier mean</div>
+          </div>
+
+          <div style={{ ...glanceCard, borderTop: "4px solid #16a34a" }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.muted }}>Workspace completion</div>
+            <div style={{ fontSize: 40, fontWeight: 900, marginTop: 8, color: "#15803d" }}>{completionPct}%</div>
+            <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>Score + evidence strength per domain</div>
+            <div
+              style={{
+                marginTop: 12,
+                height: 8,
+                borderRadius: 999,
+                background: "#e2e8f0",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  width: `${completionPct}%`,
+                  height: "100%",
+                  borderRadius: 999,
+                  background: "linear-gradient(90deg, #22c55e, #16a34a)",
+                  transition: "width 0.25s ease",
+                }}
+              />
+            </div>
+          </div>
+
+          <div
+            style={{
+              ...glanceCard,
+              borderTop: `4px solid ${riskVisual.accent}`,
+              background: riskVisual.fill,
+              borderColor: riskVisual.rail,
+            }}
+          >
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.muted }}>Risk level</div>
+            <div style={{ fontSize: 18, fontWeight: 900, marginTop: 10, color: riskVisual.accent }}>
+              {riskVisual.headline}
+            </div>
+            <p style={{ margin: "10px 0 0", fontSize: 12, lineHeight: 1.5, color: C.text, flex: 1 }}>{riskVisual.sub}</p>
+            <div style={{ marginTop: 10 }}>
+              <span
+                style={{
+                  display: "inline-block",
+                  padding: "4px 10px",
+                  borderRadius: 999,
+                  fontSize: 10,
+                  fontWeight: 800,
+                  letterSpacing: "0.04em",
+                  background: riskVisual.chipBg,
+                  color: riskVisual.accent,
+                }}
+              >
+                {riskVisual.chip}
+              </span>
+              {model.criticalGaps > 0 && (
+                <span style={{ fontSize: 11, color: C.muted, marginLeft: 8 }}>
+                  {model.criticalGaps} critical gap{model.criticalGaps === 1 ? "" : "s"}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div style={{ ...glanceCard, borderTop: "4px solid #6366f1" }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.muted }}>Review status</div>
+            <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: C.muted, width: 72 }}>AI</span>
+                <span
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    padding: "6px 12px",
+                    borderRadius: 999,
+                    fontSize: 12,
+                    fontWeight: 800,
+                    background: aiReviewed ? "#dcfce7" : "#f1f5f9",
+                    color: aiReviewed ? "#166534" : "#64748b",
+                    border: aiReviewed ? "1px solid #86efac" : "1px solid #cbd5e1",
+                  }}
+                >
+                  {aiReviewed ? "AI reviewed" : "AI pending"}
+                </span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: C.muted, width: 72 }}>QA</span>
+                <span
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    padding: "6px 12px",
+                    borderRadius: 999,
+                    fontSize: 12,
+                    fontWeight: 800,
+                    background: qaComplete ? "#dcfce7" : "#fff7ed",
+                    color: qaComplete ? "#166534" : "#c2410c",
+                    border: qaComplete ? "1px solid #86efac" : "1px solid #fdba74",
+                  }}
+                >
+                  {qaComplete ? "QA complete" : "QA attention"}
+                </span>
+              </div>
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 12, lineHeight: 1.45 }}>
+              AI = evidence suggestions run for every domain. QA = no unresolved critical pre-report checks.
+            </div>
+          </div>
+        </div>
+
         <div
           style={{
             display: "grid",
@@ -2323,18 +2630,6 @@ function CommandCenterPageContent({
           }}
         >
           {[
-            {
-              label: "Overall maturity score",
-              value: String(liveAssessment.overallScore),
-              sub: `${liveAssessment.maturityBand} · ${liveAssessment.maturityTier} tier`,
-              badge: { text: "Portfolio", bg: "#eff6ff", fg: "#1d4ed8" },
-            },
-            {
-              label: "Assessment completeness",
-              value: `${completionPct}%`,
-              sub: "Score + evidence captured per domain",
-              badge: { text: "Coverage", bg: "#f0fdf4", fg: "#166534" },
-            },
             {
               label: "Domains needing review",
               value: String(model.domainsNeedingReview),
@@ -2937,7 +3232,7 @@ function ReviewQueuePageContent({
                       <textarea
                         value={reviewerNotesByDomain[e.id] ?? ""}
                         onChange={(ev) => onReviewerNoteChange(e.id, ev.target.value)}
-                        placeholder="Partner / manager note…"
+                        placeholder="Reviewer comment"
                         style={{ ...selectStyle, minHeight: 64, width: "100%", fontSize: 12 }}
                       />
                     </td>
@@ -2978,8 +3273,8 @@ function ResultsPageContent({
             boxShadow: "0 2px 12px rgba(245,158,11,0.12)",
           }}
         >
-          <strong>Preview mode.</strong> Click <strong>Generate assessment</strong> in the header to commit this run for
-          MI / leadership packs. Metrics reflect your current workspace in real time.
+          <strong>Draft view.</strong> Select <strong>Generate assessment</strong> in the header to finalize narratives for
+          management reporting. All metrics reflect your current workspace.
         </div>
       )}
 
@@ -3034,8 +3329,8 @@ function ResultsPageContent({
             Executive export
           </div>
           <p style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.55 }}>
-            Download a PowerPoint report (.pptx): title slide and executive summary slide. Review the{" "}
-            <strong>pre-report quality check</strong> above before exporting.
+            Download a PowerPoint report (.pptx) with title, executive summary, maturity table, gaps, and roadmap. Review
+            the <strong>pre-report quality check</strong> above before exporting.
           </p>
           <p
             style={{
@@ -3074,7 +3369,7 @@ function ResultsPageContent({
         <ClientAssessmentDraftSection draft={clientDraft} narrativeLoading={narrativeLoading} />
       )}
 
-      {/* Executive summary — AI / placeholder after Generate; engine text in preview */}
+      {/* Executive summary — narrative after Generate */}
       <section
         style={{
           borderRadius: 16,
@@ -3587,7 +3882,7 @@ function LibraryPageContent({ libraryRefreshTrigger = 0 }) {
               type="search"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Text in finding, recommendation, domain…"
+              placeholder="Search library"
               style={selectStyle}
             />
           </Field>
@@ -3937,8 +4232,9 @@ function SettingsPageContent({ profileExtended, domainRows, liveAssessment, asse
         <Field label="Assessment type (workspace)">
           <input readOnly value={assessmentType} style={{ ...selectStyle, cursor: "default", color: C.muted }} />
         </Field>
-        <p style={{ margin: "14px 0 0", fontSize: 12, color: C.muted, lineHeight: 1.5 }}>
-          Framework selection is illustrative in this client-side demo; embedded scoring logic is unchanged.
+        <p style={{ margin: "14px 0 0", fontSize: 13, color: C.muted, lineHeight: 1.55 }}>
+          The active framework governs domain definitions and scoring rubric. Version history supports alignment with your
+          governance calendar.
         </p>
       </SectionCard>
 
@@ -3949,7 +4245,8 @@ function SettingsPageContent({ profileExtended, domainRows, liveAssessment, asse
             <div style={{ fontSize: 28, fontWeight: 900, marginTop: 4 }}>{BENCHMARK_SCORE}</div>
           </div>
           <p style={{ margin: 0, flex: "1 1 240px", fontSize: 13, color: C.muted, lineHeight: 1.55 }}>
-            Fixed reference for demo comparisons. Replace with peer percentiles or regulatory minimums when wiring a backend.
+            Reference mean used for relative gap analysis. Configure organization-specific benchmarks when integrating your
+            peer or supervisory data sources.
           </p>
         </div>
       </SectionCard>
@@ -4467,6 +4764,12 @@ export default function App() {
     }
   }, [flashPersistenceStatus]);
 
+  useEffect(() => {
+    if (!NAV_PAGE_IDS.has(activePage)) {
+      setActivePage("assessment");
+    }
+  }, [activePage]);
+
   const startNewAssessment = useCallback(() => {
     if (
       !window.confirm(
@@ -4495,6 +4798,35 @@ export default function App() {
     flashPersistenceStatus("New assessment started");
   }, [flashPersistenceStatus]);
 
+  const loadDemoAssessment = useCallback(() => {
+    const demoRows = buildDemoDomainRows();
+    setProfile({ ...DEMO_ASSESSMENT_PROFILE });
+    setAssessmentType(DEMO_ASSESSMENT_TYPE);
+    setScopeNotes(DEMO_SCOPE_NOTES);
+    setSupportingEvidenceText(DEMO_SUPPORTING_TEXT);
+    setDomainRows(demoRows);
+    setAiSuggestionsByDomain(
+      buildDemoAiSuggestionsFromWorkspace(
+        DEMO_ASSESSMENT_PROFILE,
+        DEMO_ASSESSMENT_TYPE,
+        demoRows,
+        DEMO_SUPPORTING_TEXT
+      )
+    );
+    setAnalysisStatus("Suggested");
+    setHasGenerated(false);
+    setAiNarratives(null);
+    setNarrativeLoading(false);
+    setAnalysisLoading(false);
+    setReviewFollowUpByDomain({});
+    setReviewerNotesByDomain({});
+    setManagerReviewStatus("pending");
+    setLibrarySuggestionsByDomain({});
+    setReportStatus("Report generation ready");
+    setActivePage("assessment");
+    flashPersistenceStatus("Demo loaded");
+  }, [flashPersistenceStatus]);
+
   const generateTPRMReport = async () => {
     try {
       setReportStatus("Generating report...");
@@ -4502,22 +4834,28 @@ export default function App() {
       const pptx = new pptxgen();
       pptx.layout = "LAYOUT_WIDE";
       pptx.author = "Digital Risk";
+      pptx.title = "TPRM Maturity Assessment Report";
+
+      /** PptxGenJS expects 6-char hex without '#' */
+      const TC = {
+        title: "111827",
+        body: "1F2937",
+        sub: "374151",
+        muted: "6B7280",
+        headerBg: "1E3A8A",
+        headerFg: "FFFFFF",
+        border: "64748B",
+      };
+
+      const clip = (s, n) => {
+        const t = String(s || "");
+        return t.length <= n ? t : `${t.slice(0, n - 1)}…`;
+      };
 
       const execBody =
         (aiNarratives?.executiveSummary && String(aiNarratives.executiveSummary).trim()) ||
         (liveAssessment.executiveSummary && String(liveAssessment.executiveSummary).trim()) ||
-        "Executive summary not yet generated — run Generate assessment or enter scores to populate narrative.";
-
-      const matrixLines =
-        liveAssessment.entries?.length > 0
-          ? liveAssessment.entries
-              .map((e) => {
-                const band = matrixMaturityBand(e.score).label;
-                const pri = matrixPriority(e.score, e.evidence).label;
-                return `${e.label}: ${e.score}/5 · ${band} · evidence ${e.evidence} · ${pri}`;
-              })
-              .join("\n")
-          : "No domain scores — complete the assessment worksheet to build the maturity matrix.";
+        "Use Generate assessment in the application header to produce an executive narrative for this workspace.";
 
       const gapLines =
         liveAssessment.topGapsAll?.length > 0
@@ -4525,167 +4863,242 @@ export default function App() {
               .slice(0, 5)
               .map((g) => `• ${g.domain} (${g.score}/5, ${g.evidence}): ${g.rationale}`)
               .join("\n")
-          : "Top gaps will appear after domain scores are entered — placeholder until data is available.";
+          : "Enter domain scores and evidence to populate prioritized gaps for this export.";
 
       const roadmap = liveAssessment.roadmap;
+      const roadmapFallback =
+        "  • Assign remediation owners and dates in the Assessment workspace to populate this horizon.";
       const roadmapText = roadmap
         ? [
             "30 days — stabilize",
-            ...(roadmap.d30?.length ? roadmap.d30.map((x) => `  • ${x}`) : ["  • (add remediation items in app)"]),
+            ...(roadmap.d30?.length ? roadmap.d30.map((x) => `  • ${x}`) : [roadmapFallback]),
             "",
             "60 days — standardize",
-            ...(roadmap.d60?.length ? roadmap.d60.map((x) => `  • ${x}`) : ["  • (add remediation items in app)"]),
+            ...(roadmap.d60?.length ? roadmap.d60.map((x) => `  • ${x}`) : [roadmapFallback]),
             "",
             "90 days — optimize",
-            ...(roadmap.d90?.length ? roadmap.d90.map((x) => `  • ${x}`) : ["  • (add remediation items in app)"]),
+            ...(roadmap.d90?.length ? roadmap.d90.map((x) => `  • ${x}`) : [roadmapFallback]),
           ].join("\n")
-        : "Roadmap placeholder — assessment engine did not return horizon actions.";
+        : "Remediation horizons populate when roadmap actions are available from the scored assessment.";
 
-      const clip = (s, n) => {
-        const t = String(s || "");
-        return t.length <= n ? t : `${t.slice(0, n - 1)}…`;
-      };
+      const headerCell = (text) => ({
+        text,
+        options: {
+          bold: true,
+          fontFace: "Arial",
+          fontSize: 11,
+          color: TC.headerFg,
+          fill: { color: TC.headerBg },
+          valign: "middle",
+          align: "center",
+        },
+      });
+
+      const bodyCell = (text, align = "left") => ({
+        text: clip(text, 160),
+        options: {
+          fontFace: "Arial",
+          fontSize: 10,
+          color: TC.title,
+          valign: "middle",
+          align,
+        },
+      });
+
+      const maturityTableRows = [
+        [
+          headerCell("Domain"),
+          headerCell("Score"),
+          headerCell("Maturity band"),
+          headerCell("Evidence"),
+          headerCell("Priority"),
+        ],
+      ];
+
+      const rawEntries = Array.isArray(liveAssessment.entries) ? liveAssessment.entries : [];
+      if (rawEntries.length === 0) {
+        maturityTableRows.push([
+          bodyCell("No domain scores yet — complete the assessment worksheet.", "left"),
+          bodyCell("—", "center"),
+          bodyCell("—", "center"),
+          bodyCell("—", "center"),
+          bodyCell("—", "center"),
+        ]);
+      } else {
+        rawEntries.forEach((e) => {
+          const band = matrixMaturityBand(e.score).label;
+          const pri = matrixPriority(e.score, e.evidence).label;
+          maturityTableRows.push([
+            bodyCell(e.label, "left"),
+            bodyCell(String(e.score), "center"),
+            bodyCell(band, "center"),
+            bodyCell(String(e.evidence || "—"), "center"),
+            bodyCell(pri, "center"),
+          ]);
+        });
+      }
+
+      let slideCount = 0;
 
       // Slide 1 — Title
       const slide1 = pptx.addSlide();
+      slideCount += 1;
       slide1.background = { color: "FFFFFF" };
       slide1.addText("TPRM Maturity Assessment Report", {
-        x: 0.6,
-        y: 0.6,
-        w: 12,
-        h: 0.75,
+        x: 0.5,
+        y: 0.55,
+        w: 12.3,
+        h: 0.9,
         fontSize: 28,
         bold: true,
-        color: "111827",
+        color: TC.title,
+        fontFace: "Arial",
       });
       slide1.addText("Generated from the TPRM Maturity Assessment Engine", {
-        x: 0.6,
-        y: 1.35,
-        w: 12,
-        h: 0.45,
+        x: 0.5,
+        y: 1.45,
+        w: 12.3,
+        h: 0.5,
         fontSize: 14,
-        color: "4B5563",
+        color: TC.sub,
+        fontFace: "Arial",
       });
       slide1.addText(clip(reportClientLine(profileExtended), 120), {
-        x: 0.6,
-        y: 1.95,
-        w: 12,
-        h: 0.4,
+        x: 0.5,
+        y: 2.05,
+        w: 12.3,
+        h: 0.45,
         fontSize: 13,
-        color: "374151",
+        color: TC.body,
+        fontFace: "Arial",
       });
       slide1.addText(formatReportDate(), {
-        x: 0.6,
-        y: 2.45,
-        w: 12,
+        x: 0.5,
+        y: 2.55,
+        w: 12.3,
         h: 0.35,
         fontSize: 12,
-        color: "6B7280",
+        color: TC.muted,
+        fontFace: "Arial",
       });
 
       // Slide 2 — Executive Summary
       const slide2 = pptx.addSlide();
+      slideCount += 1;
       slide2.background = { color: "FFFFFF" };
       slide2.addText("Executive Summary", {
-        x: 0.6,
-        y: 0.5,
-        w: 12,
-        h: 0.55,
+        x: 0.5,
+        y: 0.45,
+        w: 12.3,
+        h: 0.6,
         fontSize: 22,
         bold: true,
-        color: "111827",
+        color: TC.title,
+        fontFace: "Arial",
       });
       slide2.addText(clip(execBody, 2800), {
-        x: 0.6,
+        x: 0.5,
         y: 1.15,
-        w: 12,
-        h: 5.2,
+        w: 12.3,
+        h: 5.45,
         fontSize: 12,
-        color: "374151",
+        color: TC.body,
+        fontFace: "Arial",
         valign: "top",
         wrap: true,
       });
 
-      // Slide 3 — Maturity Matrix
+      // Slide 3 — Maturity table
       const slide3 = pptx.addSlide();
+      slideCount += 1;
       slide3.background = { color: "FFFFFF" };
-      slide3.addText("Maturity Matrix", {
-        x: 0.6,
-        y: 0.5,
-        w: 12,
+      slide3.addText("Maturity assessment table", {
+        x: 0.5,
+        y: 0.45,
+        w: 12.3,
         h: 0.55,
         fontSize: 22,
         bold: true,
-        color: "111827",
+        color: TC.title,
+        fontFace: "Arial",
       });
-      slide3.addText(`Overall: ${liveAssessment.overallScore ?? "—"} / 5 · ${liveAssessment.maturityBand ?? "—"} (${liveAssessment.maturityTier ?? "—"} tier)`, {
-        x: 0.6,
-        y: 1.05,
-        w: 12,
-        h: 0.4,
-        fontSize: 13,
-        color: "1F2937",
-      });
-      slide3.addText(clip(matrixLines, 4500), {
-        x: 0.6,
-        y: 1.5,
-        w: 12,
-        h: 4.85,
-        fontSize: 11,
-        color: "374151",
-        valign: "top",
-        wrap: true,
+      slide3.addText(
+        `Overall: ${liveAssessment.overallScore ?? "—"} / 5 · ${liveAssessment.maturityBand ?? "—"} (${liveAssessment.maturityTier ?? "—"} tier)`,
+        {
+          x: 0.5,
+          y: 1.05,
+          w: 12.3,
+          h: 0.38,
+          fontSize: 13,
+          color: TC.body,
+          fontFace: "Arial",
+        }
+      );
+      slide3.addTable(maturityTableRows, {
+        x: 0.5,
+        y: 1.55,
+        w: 12.3,
+        colW: [4.15, 0.85, 1.45, 1.35, 1.55],
+        border: { type: "solid", color: TC.border, pt: 1 },
+        fontFace: "Arial",
+        rowH: 0.34,
       });
 
       // Slide 4 — Top Gaps
       const slide4 = pptx.addSlide();
+      slideCount += 1;
       slide4.background = { color: "FFFFFF" };
       slide4.addText("Top Gaps", {
-        x: 0.6,
-        y: 0.5,
-        w: 12,
+        x: 0.5,
+        y: 0.45,
+        w: 12.3,
         h: 0.55,
         fontSize: 22,
         bold: true,
-        color: "111827",
+        color: TC.title,
+        fontFace: "Arial",
       });
       slide4.addText(clip(gapLines, 4500), {
-        x: 0.6,
+        x: 0.5,
         y: 1.1,
-        w: 12,
+        w: 12.3,
         h: 5.25,
         fontSize: 12,
-        color: "374151",
+        color: TC.body,
+        fontFace: "Arial",
         valign: "top",
         wrap: true,
       });
 
       // Slide 5 — 30 / 60 / 90 Roadmap
       const slide5 = pptx.addSlide();
+      slideCount += 1;
       slide5.background = { color: "FFFFFF" };
       slide5.addText("30 / 60 / 90 Day Roadmap", {
-        x: 0.6,
-        y: 0.5,
-        w: 12,
+        x: 0.5,
+        y: 0.45,
+        w: 12.3,
         h: 0.55,
         fontSize: 22,
         bold: true,
-        color: "111827",
+        color: TC.title,
+        fontFace: "Arial",
       });
       slide5.addText(clip(roadmapText, 4500), {
-        x: 0.6,
+        x: 0.5,
         y: 1.1,
-        w: 12,
+        w: 12.3,
         h: 5.25,
         fontSize: 12,
-        color: "374151",
+        color: TC.body,
+        fontFace: "Arial",
         valign: "top",
         wrap: true,
       });
 
-      console.log("Slides created:", pptx._slides?.length);
+      console.log(`Slides created: ${slideCount}`);
 
-      const arrayBuffer = await pptx.write("arraybuffer");
+      const arrayBuffer = await pptx.write({ outputType: "arraybuffer" });
 
       const blob = new Blob([arrayBuffer], {
         type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -4717,34 +5130,127 @@ export default function App() {
 
   const header = PAGE_HEADER[activePage] ?? PAGE_HEADER.assessment;
 
+  const domainsLoadedCount = Object.keys(domainRows).length;
+  const domainsCatalogCount = DOMAINS.length;
+
+  let persistedDraftPresent = false;
+  try {
+    if (typeof localStorage !== "undefined") {
+      persistedDraftPresent = Boolean(localStorage.getItem(TPRM_ASSESSMENT_DRAFT_KEY));
+    }
+  } catch {
+    persistedDraftPresent = false;
+  }
+
+  const workspaceMatchesDemoSeed = useMemo(() => {
+    if (JSON.stringify(profile) !== JSON.stringify(defaultProfile)) return false;
+    const base = initialDomainRows();
+    return DOMAINS.every((d) => {
+      const r = domainRows[d.id];
+      const b = base[d.id];
+      if (!r || !b) return false;
+      return (
+        r.score === b.score &&
+        r.evidence === b.evidence &&
+        String(r.notes || "").trim() === "" &&
+        String(r.recommendationDraft || "").trim() === ""
+      );
+    });
+  }, [profile, domainRows]);
+
+  const demoDataLoadedLabel = persistedDraftPresent
+    ? "Yes (saved draft in browser)"
+    : workspaceMatchesDemoSeed
+      ? "No (in-memory default seed only)"
+      : "No (customized workspace, no saved draft)";
+
   return (
-    <>
+    <div
+      className="tprm-app-root"
+      style={{
+        minHeight: "100vh",
+        width: "100%",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
       <style>{`
         html, body, #root { height: 100%; margin: 0; }
         * { box-sizing: border-box; }
-        body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+        body {
+          font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+          -webkit-font-smoothing: antialiased;
+        }
         select, textarea, button { font: inherit; }
-        textarea { resize: vertical; min-height: 56px; }
+        textarea { resize: vertical; min-height: 56px; line-height: 1.5; }
       `}</style>
+
+      {import.meta.env.DEV ? (
+        <div
+          role="status"
+          aria-label="Debug panel"
+          style={{
+            flexShrink: 0,
+            width: "100%",
+            padding: "10px 14px",
+            background: "#fef9c3",
+            borderBottom: "3px solid #ca8a04",
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+            fontSize: 12,
+            lineHeight: 1.45,
+            color: "#422006",
+            boxShadow: "0 2px 8px rgba(180, 83, 9, 0.15)",
+            zIndex: 50,
+          }}
+        >
+          <div style={{ fontWeight: 800, letterSpacing: "0.06em", marginBottom: 6, fontSize: 11, color: "#713f12" }}>
+            DEBUG
+          </div>
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: "6px 28px",
+              alignItems: "baseline",
+            }}
+          >
+            <span>
+              <strong>Page:</strong> {activePage}
+            </span>
+            <span style={{ maxWidth: "100%", wordBreak: "break-word" }}>
+              <strong>Report status:</strong> {reportStatus}
+            </span>
+            <span>
+              <strong>Domains loaded:</strong> {domainsLoadedCount} / {domainsCatalogCount}
+            </span>
+            <span style={{ maxWidth: "100%", wordBreak: "break-word" }}>
+              <strong>Demo data loaded:</strong> {demoDataLoadedLabel}
+            </span>
+          </div>
+        </div>
+      ) : null}
 
       <div
         style={{
           display: "flex",
-          minHeight: "100vh",
+          flex: 1,
+          minHeight: 0,
+          width: "100%",
           background: "linear-gradient(165deg, #e2e8f0 0%, #f1f5f9 45%, #f8fafc 100%)",
           color: C.text,
         }}
       >
         {/* Sidebar */}
         <aside
+          aria-label="Primary navigation"
           style={{
-            width: 236,
+            width: 240,
             flexShrink: 0,
             background: C.sidebar,
             color: "#fff",
             display: "flex",
             flexDirection: "column",
-            padding: "20px 0",
+            padding: "22px 0",
             borderRight: "1px solid #1e293b",
           }}
         >
@@ -4760,8 +5266,16 @@ export default function App() {
             >
               Digital Risk
             </div>
-            <div style={{ fontSize: 15, fontWeight: 800, marginTop: 6 }}>
-              TPRM Command
+            <div
+              style={{
+                fontSize: 14,
+                fontWeight: 800,
+                marginTop: 8,
+                lineHeight: 1.3,
+                wordBreak: "break-word",
+              }}
+            >
+              TPRM Maturity Assessment Engine
             </div>
           </div>
           <nav style={{ padding: "16px 12px", flex: 1 }}>
@@ -4772,13 +5286,14 @@ export default function App() {
                   key={id}
                   type="button"
                   onClick={() => setActivePage(id)}
+                  aria-current={active ? "page" : undefined}
                   style={{
                     display: "block",
                     width: "100%",
                     textAlign: "left",
-                    padding: "10px 12px",
+                    padding: "11px 14px",
                     borderRadius: 8,
-                    marginBottom: 4,
+                    marginBottom: 6,
                     fontSize: 13,
                     fontWeight: active ? 700 : 500,
                     background: active ? "rgba(37,99,235,0.25)" : "transparent",
@@ -4809,13 +5324,13 @@ export default function App() {
           {/* Header */}
           <header
             style={{
-              minHeight: 58,
+              minHeight: 62,
               flexShrink: 0,
               display: "flex",
               alignItems: "center",
               justifyContent: "space-between",
-              gap: 12,
-              padding: "10px 28px",
+              gap: 14,
+              padding: "14px 32px",
               background: "linear-gradient(180deg, #ffffff 0%, #f8fafc 100%)",
               borderBottom: `1px solid ${C.border}`,
               boxShadow: "0 4px 20px rgba(15,23,42,0.06)",
@@ -4825,9 +5340,29 @@ export default function App() {
               <div style={{ fontSize: 11, color: C.muted, fontWeight: 600 }}>
                 {header.eyebrow}
               </div>
-              <h1 style={{ margin: 2, fontSize: 18, fontWeight: 800, letterSpacing: "-0.02em" }}>
-                {header.title}
+              <h1
+                style={{
+                  margin: "4px 0 2px",
+                  fontSize: 20,
+                  fontWeight: 800,
+                  letterSpacing: "-0.02em",
+                  color: C.text,
+                }}
+              >
+                TPRM Maturity Assessment Engine
               </h1>
+              {header.title !== "TPRM Maturity Assessment Engine" && (
+                <div
+                  style={{
+                    fontSize: 15,
+                    fontWeight: 700,
+                    color: C.text,
+                    letterSpacing: "-0.01em",
+                  }}
+                >
+                  {header.title}
+                </div>
+              )}
             </div>
             <div
               style={{
@@ -4947,6 +5482,23 @@ export default function App() {
               </button>
               <button
                 type="button"
+                onClick={loadDemoAssessment}
+                style={{
+                  padding: "10px 16px",
+                  borderRadius: 10,
+                  border: "2px solid #d97706",
+                  background: "linear-gradient(180deg, #fef3c7 0%, #fde68a 100%)",
+                  fontWeight: 800,
+                  fontSize: 13,
+                  cursor: "pointer",
+                  color: "#78350f",
+                  boxShadow: "0 2px 12px rgba(217,119,6,0.35)",
+                }}
+              >
+                Load Demo Assessment
+              </button>
+              <button
+                type="button"
                 onClick={loadAssessmentFromLocalStorage}
                 style={{
                   padding: "9px 14px",
@@ -4985,7 +5537,8 @@ export default function App() {
                     color:
                       persistenceStatus === "Saved successfully" ||
                       persistenceStatus === "Loaded successfully" ||
-                      persistenceStatus === "New assessment started"
+                      persistenceStatus === "New assessment started" ||
+                      persistenceStatus === "Demo loaded"
                         ? "#15803d"
                         : "#b45309",
                     whiteSpace: "nowrap",
@@ -5004,7 +5557,7 @@ export default function App() {
               style={{
                 flex: 1,
                 overflowY: "auto",
-                padding: "24px 28px 48px",
+                padding: "28px 32px 56px",
               }}
             >
               {activePage === "commandCenter" && (
@@ -5026,6 +5579,61 @@ export default function App() {
 
               {activePage === "assessment" && (
               <>
+              <div
+                style={{
+                  marginBottom: 24,
+                  padding: "18px 20px",
+                  borderRadius: 14,
+                  border: "2px solid #f59e0b",
+                  background: "linear-gradient(135deg, #fffbeb 0%, #fef3c7 55%, #fff 100%)",
+                  boxShadow: "0 8px 28px rgba(245,158,11,0.18)",
+                  display: "flex",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 16,
+                }}
+              >
+                <div style={{ flex: "1 1 280px", minWidth: 0 }}>
+                  <div
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 800,
+                      letterSpacing: "0.08em",
+                      color: "#b45309",
+                      textTransform: "uppercase",
+                      marginBottom: 6,
+                    }}
+                  >
+                    Sample workspace
+                  </div>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: C.text, marginBottom: 6 }}>
+                    Load sample assessment data
+                  </div>
+                  <p style={{ margin: 0, fontSize: 14, color: C.muted, lineHeight: 1.55 }}>
+                    Applies a full client profile, domain scores, evidence notes, supporting text, and AI suggestions. Your
+                    browser-saved draft is unchanged until you choose Save.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={loadDemoAssessment}
+                  style={{
+                    flexShrink: 0,
+                    padding: "14px 22px",
+                    borderRadius: 12,
+                    border: "2px solid #d97706",
+                    background: "linear-gradient(180deg, #fbbf24 0%, #f59e0b 100%)",
+                    fontWeight: 800,
+                    fontSize: 15,
+                    cursor: "pointer",
+                    color: "#451a03",
+                    boxShadow: "0 6px 20px rgba(217,119,6,0.45)",
+                  }}
+                >
+                  Load Demo Assessment
+                </button>
+              </div>
               {/* Client Profile */}
               <SectionCard title="Client profile" subtitle="Organizational context shapes interpretation and remediation sequencing.">
                 <div
@@ -5076,7 +5684,7 @@ export default function App() {
                         type="text"
                         value={profile.clientName ?? ""}
                         onChange={(e) => setProfile((p) => ({ ...p, clientName: e.target.value }))}
-                        placeholder="e.g. Acme Financial Services"
+                        placeholder="Organization name (optional)"
                         style={selectStyle}
                       />
                     </Field>
@@ -5103,7 +5711,7 @@ export default function App() {
                   <textarea
                     value={scopeNotes}
                     onChange={(e) => setScopeNotes(e.target.value)}
-                    placeholder="e.g. Focus on Tier-1 outsourcers in EU entities…"
+                    placeholder="Scope, entities, and review period for this cycle"
                     style={{ ...selectStyle, minHeight: 72, lineHeight: 1.5 }}
                   />
                 </Field>
@@ -5111,7 +5719,7 @@ export default function App() {
                   <textarea
                     value={supportingEvidenceText}
                     onChange={(e) => setSupportingEvidenceText(e.target.value)}
-                    placeholder="Paste supporting text used across domains (audits, policy excerpts, control test outputs)..."
+                    placeholder="Cross-domain evidence: audits, policies, test results, committee materials"
                     style={{ ...selectStyle, minHeight: 90, lineHeight: 1.5 }}
                   />
                 </Field>
@@ -5291,7 +5899,7 @@ export default function App() {
                                     },
                                   }))
                                 }
-                                placeholder="Artifacts reviewed, limitations, follow-ups…"
+                                placeholder="Control tests, interviews, and documentation for this domain"
                                 style={{ ...selectStyle, minHeight: 64 }}
                               />
                             </Field>
@@ -5309,7 +5917,7 @@ export default function App() {
                                     },
                                   }))
                                 }
-                                placeholder="Optional: park reusable recommendation language here before Generate assessment."
+                                placeholder="Draft recommendation language (optional)"
                                 style={{ ...selectStyle, minHeight: 56 }}
                               />
                             </Field>
@@ -5665,6 +6273,41 @@ export default function App() {
                   aiNarratives={aiNarratives}
                 />
               )}
+
+              {!NAV_PAGE_IDS.has(activePage) && (
+                <div
+                  style={{
+                    padding: 32,
+                    maxWidth: 520,
+                    borderRadius: 12,
+                    border: `1px solid ${C.border}`,
+                    background: C.surface,
+                  }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 800, color: C.muted, marginBottom: 8 }}>
+                    Unrecognized view
+                  </div>
+                  <p style={{ margin: "0 0 16px", fontSize: 14, lineHeight: 1.5, color: C.text }}>
+                    Choose a section from the left navigation: Command Center, Assessment, Results, and more.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setActivePage("assessment")}
+                    style={{
+                      background: C.accent,
+                      color: "#fff",
+                      border: "none",
+                      borderRadius: 8,
+                      padding: "10px 16px",
+                      fontWeight: 700,
+                      fontSize: 13,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Open Assessment
+                  </button>
+                </div>
+              )}
             </main>
 
             {/* Right summary rail — while configuring assessment */}
@@ -5697,7 +6340,7 @@ export default function App() {
                   }}
                 >
                   Run <strong style={{ color: C.text }}>Generate assessment</strong> to unlock this summary and jump to{" "}
-                  <strong style={{ color: C.text }}>Results</strong>. You can still preview full metrics on Results anytime.
+                  <strong style={{ color: C.text }}>Results</strong> for detailed metrics and narratives at any time.
                 </div>
               ) : (
                 <>
@@ -5795,17 +6438,18 @@ export default function App() {
           </div>
         </div>
       </div>
-    </>
+    </div>
   );
 }
 
 const selectStyle = {
   width: "100%",
-  padding: "10px 12px",
+  padding: "11px 14px",
   borderRadius: 8,
   border: "1px solid #cbd5e1",
   background: "#fff",
-  fontSize: 13,
+  fontSize: 14,
+  lineHeight: 1.45,
 };
 
 function SectionCard({ title, subtitle, children }) {
@@ -5815,16 +6459,27 @@ function SectionCard({ title, subtitle, children }) {
         background: C.surface,
         borderRadius: 16,
         border: `1px solid ${C.border}`,
-        padding: "22px 24px",
-        marginBottom: 22,
-        boxShadow: "0 4px 24px rgba(15,23,42,0.07)",
+        padding: "26px 28px",
+        marginBottom: 24,
+        boxShadow: "0 4px 24px rgba(15,23,42,0.06)",
       }}
     >
-      <h2 style={{ margin: 0, fontSize: 17, fontWeight: 800, letterSpacing: "-0.02em" }}>{title}</h2>
+      <h2
+        style={{
+          margin: 0,
+          fontSize: 18,
+          fontWeight: 800,
+          letterSpacing: "-0.02em",
+          color: C.text,
+          lineHeight: 1.25,
+        }}
+      >
+        {title}
+      </h2>
       {subtitle && (
-        <p style={{ margin: "6px 0 18px", fontSize: 13, color: C.muted, lineHeight: 1.5 }}>{subtitle}</p>
+        <p style={{ margin: "8px 0 20px", fontSize: 14, color: C.muted, lineHeight: 1.55 }}>{subtitle}</p>
       )}
-      {!subtitle && <div style={{ height: 4 }} />}
+      {!subtitle && <div style={{ height: 6 }} />}
       {children}
     </section>
   );
@@ -5832,8 +6487,8 @@ function SectionCard({ title, subtitle, children }) {
 
 function Field({ label, children }) {
   return (
-    <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#334155" }}>
-      <span style={{ display: "block", marginBottom: 6 }}>{label}</span>
+    <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#334155" }}>
+      <span style={{ display: "block", marginBottom: 8 }}>{label}</span>
       {children}
     </label>
   );
