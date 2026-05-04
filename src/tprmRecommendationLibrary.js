@@ -248,6 +248,55 @@ export function buildPlaceholderRecommendationLines(d) {
 }
 
 /**
+ * Merge live assessment entries with TPRM_DOMAIN_LIBRARY for Library / insights UI.
+ * Prioritizes lowest-scoring domains (same ordering philosophy as remediation).
+ * @param {Array<{ id: string, label: string, score: number, evidence: string, weighted?: number }>} entries
+ * @param {{ benchmarkScore?: number, limit?: number }} opts
+ */
+export function buildWorkspaceLibraryInsights(entries, opts = {}) {
+  const benchmarkScore = opts.benchmarkScore ?? 3.5;
+  const limit = opts.limit ?? 5;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return { portfolioMean: null, tierCue: "", tierKey: "Moderate", rows: [] };
+  }
+
+  const sorted = [...entries].sort((a, b) => {
+    if (a.score !== b.score) return a.score - b.score;
+    const wa = typeof a.weighted === "number" ? a.weighted : a.score;
+    const wb = typeof b.weighted === "number" ? b.weighted : b.score;
+    return wa - wb;
+  });
+
+  const avg = entries.reduce((s, e) => s + e.score, 0) / entries.length;
+  const tierKey = avg < 2.5 ? "Low" : avg <= 3.5 ? "Moderate" : "Advanced";
+  const tierCue = (TIER_CROSS_CUTTING[tierKey] || TIER_CROSS_CUTTING.Moderate)[0];
+
+  const rows = sorted.slice(0, limit).map((e) => {
+    const lib = TPRM_DOMAIN_LIBRARY[e.id];
+    const gapToBench = Math.round((e.score - benchmarkScore) * 10) / 10;
+    const entryForTpl = { id: e.id, label: e.label, score: e.score, evidence: e.evidence };
+    return {
+      domainId: e.id,
+      label: e.label,
+      score: e.score,
+      evidence: e.evidence,
+      gapToBench,
+      commonGaps: lib?.commonGaps?.slice(0, 4) ?? [],
+      templates: (lib?.templates ?? []).slice(0, 2).map((tpl) =>
+        evidenceQualify(applyTemplate(tpl, entryForTpl), entryForTpl)
+      ),
+    };
+  });
+
+  return {
+    portfolioMean: Math.round(avg * 10) / 10,
+    tierCue,
+    tierKey,
+    rows,
+  };
+}
+
+/**
  * Short hints for OpenAI user prompt — steer model toward library-aligned actions without pasting the whole library.
  * @param {Array<{ domainId: string, domain: string, score: number, evidence: string }>} topGaps
  */

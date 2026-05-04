@@ -3,9 +3,11 @@ import pptxgen from "pptxgenjs";
 import {
   buildPlaceholderRecommendationLines,
   buildRemediationPlan,
+  buildWorkspaceLibraryInsights,
   getLibraryHintsForOpenAI,
   TPRM_DOMAIN_LIBRARY,
 } from "./tprmRecommendationLibrary.js";
+import { parseEvidenceFileToText } from "./evidenceExtraction.js";
 
 // --- Domain catalog & scoring engine (embedded) ---
 
@@ -364,15 +366,22 @@ async function generateNarrative(assessmentData, memoryOptions = null) {
 
   if (!apiKey) {
     const base = generatePlaceholderNarrative(assessmentData);
+    const digest = String(assessmentData.supportingEvidenceDigest || "").trim();
+    const evNote =
+      digest.length > 0 || (assessmentData.uploadedFileCount || 0) > 0
+        ? ` Supporting evidence on file: ${digest.length} characters of pasted/uploaded text; ${assessmentData.uploadedFileCount || 0} uploaded file(s) this session.`
+        : "";
     if (memoryBlock) {
       const note = `\n\n[Institutional memory — similar prior assessments]\n${memoryBlock.slice(0, 1200)}`;
       return {
         ...base,
-        executiveSummary: base.executiveSummary + note,
+        executiveSummary: base.executiveSummary + evNote + note,
         source: "placeholder",
       };
     }
-    return base;
+    return digest.length || assessmentData.uploadedFileCount
+      ? { ...base, executiveSummary: base.executiveSummary + evNote, source: "placeholder" }
+      : base;
   }
 
   const userPrompt = `You are a senior Digital Risk consultant.
@@ -392,6 +401,9 @@ Assessment Data:
 ${assessmentData.domainScoresLine}
 - Top gaps: ${assessmentData.topGapsSummary}
 - Risk themes (engine): ${assessmentData.themesLine || "N/A"}
+- Uploaded artifact files (this session): ${assessmentData.uploadedFileCount ?? 0}
+- Supporting evidence text (cross-domain, includes uploads):
+${String(assessmentData.supportingEvidenceDigest || "").trim().slice(0, 6000) || "[None provided]"}
 
 ${getLibraryHintsForOpenAI(assessmentData.topGapsForLibrary || [])}
 
@@ -444,11 +456,24 @@ Guidelines:
   } catch (e) {
     console.warn("generateNarrative falling back to placeholder:", e);
     const fallback = generatePlaceholderNarrative(assessmentData);
+    const digest = String(assessmentData.supportingEvidenceDigest || "").trim();
+    const evNote =
+      digest.length > 0 || (assessmentData.uploadedFileCount || 0) > 0
+        ? ` Supporting evidence on file: ${digest.length} characters of pasted/uploaded text; ${assessmentData.uploadedFileCount || 0} uploaded file(s) this session.`
+        : "";
     if (memoryBlock) {
       const note = `\n\n[Institutional memory — similar prior assessments]\n${memoryBlock.slice(0, 1200)}`;
-      return { ...fallback, executiveSummary: fallback.executiveSummary + note, source: "placeholder" };
+      return {
+        ...fallback,
+        executiveSummary: fallback.executiveSummary + evNote + note,
+        source: "placeholder",
+      };
     }
-    return { ...fallback, source: "placeholder" };
+    return {
+      ...fallback,
+      executiveSummary: fallback.executiveSummary + evNote,
+      source: "placeholder",
+    };
   }
 }
 
@@ -721,6 +746,12 @@ function matrixPriority(score, evidence) {
   if (score <= 2) return { label: "High", color: "#ea580c", fontWeight: 700 };
   if (score === 3) return { label: "Medium", color: "#d97706", fontWeight: 600 };
   return { label: "Low", color: "#16a34a", fontWeight: 600 };
+}
+
+/** Critical gap count — matrix "Critical" = score ≤2 with Weak evidence (same as Command Center critical gap tally). */
+function countCriticalGapEntries(entries) {
+  if (!Array.isArray(entries)) return 0;
+  return entries.filter((e) => matrixPriority(e.score, e.evidence).label === "Critical").length;
 }
 
 function formatReportDate() {
@@ -1354,7 +1385,7 @@ function evidenceConfidenceNumeric(ev) {
 
 function computeExecutiveKPIs(entries, overallScore) {
   const belowBench = entries.filter((e) => e.score < BENCHMARK_SCORE).length;
-  const criticalGaps = entries.filter((e) => e.score <= 2 && e.evidence === "Weak").length;
+  const criticalGaps = countCriticalGapEntries(entries);
   const avgEv =
     entries.reduce((s, e) => s + evidenceConfidenceNumeric(e.evidence), 0) /
     Math.max(entries.length, 1);
@@ -1754,6 +1785,44 @@ function buildDemoDomainRows() {
   return o;
 }
 
+/** Stable fingerprint of scored inputs + supporting text volume — used to detect stale AI suggestions after edits. */
+function workspaceAnalysisFingerprint(domainRows, supportingEvidenceText) {
+  const rowSig = DOMAINS.map((d) => {
+    const r = domainRows[d.id] || {};
+    return [r.score, r.evidence, String(r.notes || "").length, String(r.recommendationDraft || "").length].join(":");
+  }).join("|");
+  return `${rowSig}::${String(supportingEvidenceText || "").length}`;
+}
+
+/** True when workspace matches the built-in sample pack (Load sample assessment data). */
+function workspaceMatchesSamplePack(profile, assessmentType, scopeNotes, supportingEvidenceText, domainRows) {
+  if (assessmentType !== DEMO_ASSESSMENT_TYPE) return false;
+  const p = {
+    clientName: profile.clientName ?? "",
+    industry: profile.industry,
+    companySize: profile.companySize,
+    regulatoryIntensity: profile.regulatoryIntensity,
+    thirdPartyVolume: profile.thirdPartyVolume,
+    geographicFootprint: profile.geographicFootprint,
+  };
+  if (JSON.stringify(p) !== JSON.stringify(DEMO_ASSESSMENT_PROFILE)) return false;
+  if (String(scopeNotes || "") !== DEMO_SCOPE_NOTES) return false;
+  if (String(supportingEvidenceText || "") !== DEMO_SUPPORTING_TEXT) return false;
+  const demoRows = buildDemoDomainRows();
+  return DOMAINS.every((d) => {
+    const a = domainRows[d.id];
+    const b = demoRows[d.id];
+    return (
+      a &&
+      b &&
+      a.score === b.score &&
+      a.evidence === b.evidence &&
+      String(a.notes || "") === String(b.notes || "") &&
+      String(a.recommendationDraft || "") === String(b.recommendationDraft || "")
+    );
+  });
+}
+
 const defaultProfile = {
   clientName: "",
   industry: "Financial Services",
@@ -1764,7 +1833,34 @@ const defaultProfile = {
 };
 
 const TPRM_ASSESSMENT_DRAFT_KEY = "tprmAssessmentDraft";
-const PERSISTENCE_DRAFT_VERSION = 2;
+const PERSISTENCE_DRAFT_VERSION = 3;
+
+/** Append marker blocks so "Clear uploaded evidence" can remove them reliably. */
+function buildUploadAppendSegment(fileName, uploadedAtIso, bodyText) {
+  return `\n\n--- Uploaded: ${fileName} @ ${uploadedAtIso} ---\n${bodyText}\n--- End upload: ${fileName} ---\n`;
+}
+
+function mergeUploadedEvidenceFiles(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((x) => x && typeof x === "object")
+    .map((x) => ({
+      id: typeof x.id === "string" ? x.id : `u-${Date.now()}`,
+      name: typeof x.name === "string" ? x.name : "file",
+      mimeType: typeof x.mimeType === "string" ? x.mimeType : "",
+      size: typeof x.size === "number" ? x.size : 0,
+      uploadedAt: typeof x.uploadedAt === "string" ? x.uploadedAt : new Date().toISOString(),
+      extractStatus: [
+        "text_extracted",
+        "pdf_docx_pending",
+        "evidence_uploaded",
+        "extraction_failed",
+      ].includes(x.extractStatus)
+        ? x.extractStatus
+        : "text_extracted",
+      appendedSegment: typeof x.appendedSegment === "string" ? x.appendedSegment : "",
+    }));
+}
 
 function mergeLoadedDomainRows(raw) {
   const base = initialDomainRows();
@@ -1811,7 +1907,8 @@ function mergeLoadedAiSuggestionsByDomain(raw) {
     if (!cell || typeof cell !== "object") return;
     const sug = cell.suggestion;
     if (!sug || typeof sug !== "object") return;
-    const st = String(cell.status || "Suggested");
+    const stRaw = String(cell.status || "Suggested");
+    const st = stRaw === "Manual retained" ? "Overridden" : stRaw;
     const status = st === "Accepted" || st === "Overridden" || st === "Suggested" ? st : "Suggested";
     out[d.id] = {
       status,
@@ -2293,6 +2390,28 @@ function PillBadge({ children, bg, fg, bd }) {
   );
 }
 
+function DemoSamplePackBanner() {
+  return (
+    <div
+      style={{
+        marginBottom: 20,
+        padding: "12px 16px",
+        borderRadius: 12,
+        border: "2px solid #0ea5e9",
+        background: "linear-gradient(90deg, #e0f2fe 0%, #f0f9ff 100%)",
+        fontSize: 13,
+        color: "#0c4a6e",
+        lineHeight: 1.55,
+        boxShadow: "0 2px 10px rgba(14, 165, 233, 0.12)",
+      }}
+    >
+      <strong>Demo / sample data.</strong> This workspace matches the <strong>Load sample assessment</strong> pack. Metrics,
+      charts, the review queue, roadmap, and PowerPoint export follow your current inputs—edit any domain to leave the
+      sample snapshot.
+    </div>
+  );
+}
+
 function ExecutiveScorecard({ liveAssessment, maturityBadgeColor }) {
   const kpi = computeExecutiveKPIs(liveAssessment.entries, liveAssessment.overallScore);
   const overallBenchGap = liveAssessment.overallScore - BENCHMARK_SCORE;
@@ -2321,7 +2440,7 @@ function ExecutiveScorecard({ liveAssessment, maturityBadgeColor }) {
     {
       label: "Critical gaps",
       value: String(kpi.criticalGaps),
-      sub: "Score 1–2 + Weak evidence",
+      sub: "Critical pattern: score ≤2 + Weak evidence",
       badge:
         kpi.criticalGaps > 0
           ? { text: "Action required", bg: "#fef2f2", fg: "#991b1b" }
@@ -2420,6 +2539,8 @@ function CommandCenterPageContent({
   onAnalyzeEvidence,
   onAcceptAllHighConfidence,
   onGenerateReport,
+  demoSamplePackActive,
+  benchmarkScore = BENCHMARK_SCORE,
 }) {
   const stageDot = (done) => ({
     width: 22,
@@ -2472,6 +2593,9 @@ function CommandCenterPageContent({
             chipBg: "#d1fae5",
           };
 
+  const belowBenchCount = liveAssessment.entries.filter((e) => e.score < benchmarkScore).length;
+  const riskDetailLine = `${liveAssessment.weakCount} domain(s) score ≤2 · ${belowBenchCount} below benchmark (${benchmarkScore}) · mean ${liveAssessment.overallScore}/5.`;
+
   const glanceCard = {
     borderRadius: 16,
     padding: "18px 16px",
@@ -2485,6 +2609,7 @@ function CommandCenterPageContent({
 
   return (
     <>
+      {demoSamplePackActive ? <DemoSamplePackBanner /> : null}
       <SectionCard
         title="Engagement Command Center"
         subtitle="Leadership view of assessment progress, risk posture, AI review, QA, and export readiness."
@@ -2551,7 +2676,9 @@ function CommandCenterPageContent({
             <div style={{ fontSize: 18, fontWeight: 900, marginTop: 10, color: riskVisual.accent }}>
               {riskVisual.headline}
             </div>
-            <p style={{ margin: "10px 0 0", fontSize: 12, lineHeight: 1.5, color: C.text, flex: 1 }}>{riskVisual.sub}</p>
+            <p style={{ margin: "10px 0 0", fontSize: 12, lineHeight: 1.5, color: C.text, flex: 1 }}>
+              {riskVisual.sub} {riskDetailLine}
+            </p>
             <div style={{ marginTop: 10 }}>
               <span
                 style={{
@@ -2738,7 +2865,7 @@ function CommandCenterPageContent({
             </div>
           </div>
           <div style={{ border: `1px solid ${C.border}`, borderRadius: 14, padding: 16, background: C.surface }}>
-            <div style={{ fontSize: 12, fontWeight: 800, color: C.text, marginBottom: 8 }}>Domains below benchmark</div>
+              <div style={{ fontSize: 12, fontWeight: 800, color: C.text, marginBottom: 8 }}>Domains below benchmark</div>
             {model.belowBenchmark.length ? (
               <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: C.text, lineHeight: 1.55 }}>
                 {model.belowBenchmark.map((name) => (
@@ -2746,7 +2873,9 @@ function CommandCenterPageContent({
                 ))}
               </ul>
             ) : (
-              <div style={{ fontSize: 13, color: C.muted }}>None — all domains meet or exceed benchmark {BENCHMARK_SCORE}.</div>
+              <div style={{ fontSize: 13, color: C.muted }}>
+                None — all domains meet or exceed benchmark {benchmarkScore}.
+              </div>
             )}
           </div>
         </div>
@@ -2943,12 +3072,18 @@ function ReviewQueuePageContent({
   onReviewerNoteChange,
   acceptSuggestionForDomain,
   keepManualScoreForDomain,
+  demoSamplePackActive,
+  benchmarkScore = BENCHMARK_SCORE,
 }) {
   const sortedRows = useMemo(() => {
     const priOrder = { Critical: 0, High: 1, Medium: 2, Low: 3 };
     const built = liveAssessment.entries.map((e) => {
       const sig = computeDomainReviewSignals(e, profile, aiSuggestionsByDomain, reviewFollowUpByDomain);
-      const displayReviewStatus = sig.follow ? `Follow-up (${sig.aiStatus})` : sig.aiStatus;
+      const displayReviewStatus = sig.follow
+        ? `Follow-up (${sig.aiStatus === "Overridden" ? "Manual retained" : sig.aiStatus})`
+        : sig.aiStatus === "Overridden"
+          ? "Manual retained"
+          : sig.aiStatus;
       return {
         e,
         ...sig,
@@ -2995,6 +3130,18 @@ function ReviewQueuePageContent({
     return { domainsNeedingReview, highConfidenceAccepted, overrides, gapDomains, gapBullets };
   }, [sortedRows]);
 
+  const queueStats = useMemo(() => {
+    const belowBenchmark = liveAssessment.entries.filter((e) => e.score < benchmarkScore).length;
+    const criticalPatterns = countCriticalGapEntries(liveAssessment.entries);
+    let bigDiffCt = 0;
+    let lowConfCt = 0;
+    sortedRows.forEach((r) => {
+      if (r.bigDiff) bigDiffCt += 1;
+      if (r.lowConf) lowConfCt += 1;
+    });
+    return { belowBenchmark, criticalPatterns, bigDiffCt, lowConfCt };
+  }, [liveAssessment, sortedRows, benchmarkScore]);
+
   const btnSm = {
     padding: "6px 10px",
     borderRadius: 8,
@@ -3006,10 +3153,82 @@ function ReviewQueuePageContent({
 
   return (
     <>
+      {demoSamplePackActive ? <DemoSamplePackBanner /> : null}
       <SectionCard
         title="Manager review queue"
-        subtitle="One place to reconcile AI suggestions, manual scores, evidence gaps, and pre-export QA warnings before sign-off."
+        subtitle={`Live workspace: mean ${liveAssessment.overallScore}/5 · ${queueStats.belowBenchmark} domain(s) below benchmark (${benchmarkScore}) · ${queueStats.criticalPatterns} critical-pattern domain(s). Sorted by priority, AI/manual delta, and confidence.`}
       >
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))",
+            gap: 12,
+            marginBottom: 16,
+          }}
+        >
+          {[
+            {
+              label: "Portfolio mean",
+              value: String(liveAssessment.overallScore),
+              sub: `${liveAssessment.maturityBand} · ${liveAssessment.maturityTier} tier`,
+              badge: { text: "Live", bg: "#eff6ff", fg: "#1d4ed8" },
+            },
+            {
+              label: "Below benchmark",
+              value: String(queueStats.belowBenchmark),
+              sub: `Score < ${benchmarkScore}`,
+              badge: { text: "Gap", bg: "#fef2f2", fg: "#b91c1c" },
+            },
+            {
+              label: "Critical patterns",
+              value: String(queueStats.criticalPatterns),
+              sub: "Score ≤2 + Weak evidence",
+              badge: { text: "Risk", bg: "#fef2f2", fg: "#991b1b" },
+            },
+            {
+              label: "Manual vs AI ≥2",
+              value: String(queueStats.bigDiffCt),
+              sub: "Domains with large score delta",
+              badge: { text: "Delta", bg: "#fffbeb", fg: "#b45309" },
+            },
+            {
+              label: "Low AI confidence",
+              value: String(queueStats.lowConfCt),
+              sub: "Domains flagged for judgment",
+              badge: { text: "AI", bg: "#fef3c7", fg: "#92400e" },
+            },
+          ].map((c) => (
+            <div
+              key={c.label}
+              style={{
+                borderRadius: 12,
+                padding: "12px 12px",
+                border: `1px solid ${C.border}`,
+                background: "#fafafa",
+              }}
+            >
+              <div style={{ fontSize: 10, color: C.muted, fontWeight: 700 }}>{c.label}</div>
+              <div style={{ fontSize: 22, fontWeight: 900, marginTop: 4 }}>{c.value}</div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{c.sub}</div>
+              <div style={{ marginTop: 6 }}>
+                <span
+                  style={{
+                    display: "inline-block",
+                    padding: "2px 6px",
+                    borderRadius: 999,
+                    fontSize: 9,
+                    fontWeight: 800,
+                    background: c.badge.bg,
+                    color: c.badge.fg,
+                  }}
+                >
+                  {c.badge.text}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+
         <div
           style={{
             display: "grid",
@@ -3257,9 +3476,15 @@ function ResultsPageContent({
   reportStatus,
   reportQualityWarnings,
   clientDraft,
+  demoSamplePackActive,
+  clientLabel,
+  benchmarkScore = BENCHMARK_SCORE,
 }) {
+  const belowBench = liveAssessment.entries.filter((e) => e.score < benchmarkScore).length;
+  const critN = countCriticalGapEntries(liveAssessment.entries);
   return (
     <>
+      {demoSamplePackActive ? <DemoSamplePackBanner /> : null}
       {!hasGenerated && (
         <div
           style={{
@@ -3274,7 +3499,8 @@ function ResultsPageContent({
           }}
         >
           <strong>Draft view.</strong> Select <strong>Generate assessment</strong> in the header to finalize narratives for
-          management reporting. All metrics reflect your current workspace.
+          management reporting. Scorecard, gaps, matrix, and roadmap below recalculate from domain inputs (
+          {liveAssessment.overallScore}/5 mean · {belowBench} below benchmark · {critN} critical-pattern domains).
         </div>
       )}
 
@@ -3329,8 +3555,9 @@ function ResultsPageContent({
             Executive export
           </div>
           <p style={{ margin: 0, fontSize: 13, color: C.text, lineHeight: 1.55 }}>
-            Download a PowerPoint report (.pptx) with title, executive summary, maturity table, gaps, and roadmap. Review
-            the <strong>pre-report quality check</strong> above before exporting.
+            Download a PowerPoint (.pptx) built from this workspace: <strong>{clientLabel}</strong> · mean{" "}
+            {liveAssessment.overallScore}/5 · benchmark {benchmarkScore} · {belowBench} domain(s) below benchmark. Review the{" "}
+            <strong>pre-report quality check</strong> above before exporting.
           </p>
           <p
             style={{
@@ -3570,27 +3797,28 @@ function ResultsPageContent({
   );
 }
 
-function VisualAnalyticsPage({ liveAssessment }) {
+function VisualAnalyticsPage({ liveAssessment, demoSamplePackActive, benchmarkScore = BENCHMARK_SCORE }) {
   const entries = liveAssessment.entries;
   const n = entries.length;
   const cx = 240;
   const cy = 250;
   const R = 128;
   const clientPoly = polygonPointsFromEntries(entries, cx, cy, R, (e) => e.score);
-  const benchPoly = polygonPointsFromEntries(entries, cx, cy, R, () => BENCHMARK_SCORE);
+  const benchPoly = polygonPointsFromEntries(entries, cx, cy, R, () => benchmarkScore);
   const shortLabel = (s) => (s.length > 16 ? `${s.slice(0, 14)}…` : s);
 
-  const dist = {
-    low: entries.filter((e) => e.score <= 2).length,
-    mod: entries.filter((e) => e.score === 3).length,
-    adv: entries.filter((e) => e.score >= 4).length,
-  };
-  const distMax = Math.max(dist.low, dist.mod, dist.adv, 1);
+  const dist = { Low: 0, Moderate: 0, Advanced: 0 };
+  entries.forEach((e) => {
+    const lab = matrixMaturityBand(e.score).label;
+    dist[lab] = (dist[lab] || 0) + 1;
+  });
+  const distMax = Math.max(dist.Low, dist.Moderate, dist.Advanced, 1);
 
   const insights = buildExecutiveInsights(entries);
 
   return (
     <>
+      {demoSamplePackActive ? <DemoSamplePackBanner /> : null}
       <section
         style={{
           marginBottom: 22,
@@ -3602,16 +3830,36 @@ function VisualAnalyticsPage({ liveAssessment }) {
         }}
       >
         <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: "0.12em", opacity: 0.8 }}>VISUAL ANALYTICS</div>
-        <p style={{ margin: "10px 0 0", fontSize: 15, lineHeight: 1.65, maxWidth: 800 }}>
-          Portfolio diagnostic views: radar overlay, domain bars, risk–evidence scatter, and distribution. No external
-          chart libraries—SVG and layout-only rendering.
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "16px 28px", marginTop: 14, alignItems: "baseline" }}>
+          <div>
+            <span style={{ fontSize: 11, opacity: 0.75 }}>Mean maturity</span>
+            <div style={{ fontSize: 28, fontWeight: 900, letterSpacing: "-0.02em" }}>
+              {liveAssessment.overallScore}
+              <span style={{ fontSize: 16, fontWeight: 700, opacity: 0.85 }}> / 5</span>
+            </div>
+          </div>
+          <div>
+            <span style={{ fontSize: 11, opacity: 0.75 }}>Band · tier</span>
+            <div style={{ fontSize: 15, fontWeight: 700 }}>
+              {liveAssessment.maturityBand} · {liveAssessment.maturityTier}
+            </div>
+          </div>
+          <div>
+            <span style={{ fontSize: 11, opacity: 0.75 }}>Weak domains (≤2)</span>
+            <div style={{ fontSize: 15, fontWeight: 700 }}>{liveAssessment.weakCount}</div>
+          </div>
+        </div>
+        <p style={{ margin: "14px 0 0", fontSize: 14, lineHeight: 1.65, maxWidth: 880, opacity: 0.92 }}>
+          All visuals reflect the <strong>current workspace</strong> and update when domain scores or evidence change.
+          Radar, bars, scatter, and distribution use the same entries as the maturity matrix and executive outputs—SVG
+          rendering only (no external chart libraries). Benchmark overlay: <strong>{benchmarkScore}</strong> (sector mean).
         </p>
       </section>
 
       {/* Radar */}
       <SectionCard
         title="Maturity radar"
-        subtitle="Client scores (blue) vs benchmark ring at 3.5 (slate). Scale 1–5 on radial axis."
+        subtitle={`Client scores (blue) vs benchmark ring at ${benchmarkScore} (slate). Scale 1–5 on radial axis.`}
       >
         <div style={{ display: "flex", justifyContent: "center", padding: "8px 0 24px" }}>
           <svg width="500" height="500" viewBox="0 0 500 500" style={{ maxWidth: "100%", height: "auto" }}>
@@ -3675,13 +3923,13 @@ function VisualAnalyticsPage({ liveAssessment }) {
       {/* Domain bars + benchmark tick */}
       <SectionCard
         title="Domain maturity vs benchmark"
-        subtitle="Bar = client score; tick marks sector benchmark 3.5. Gap shown numerically."
+        subtitle={`Bar = client score; tick = sector benchmark ${benchmarkScore}. Gap = score minus benchmark.`}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {entries.map((e) => {
             const mat = matrixMaturityBand(e.score);
-            const gap = e.score - BENCHMARK_SCORE;
-            const benchPct = (BENCHMARK_SCORE / 5) * 100;
+            const gap = e.score - benchmarkScore;
+            const benchPct = (benchmarkScore / 5) * 100;
             const fillPct = (e.score / 5) * 100;
             return (
               <div key={e.id} style={{ display: "grid", gridTemplateColumns: "minmax(160px, 1fr) 2fr 80px", gap: 12, alignItems: "center" }}>
@@ -3708,7 +3956,7 @@ function VisualAnalyticsPage({ liveAssessment }) {
                         transform: "translateX(-50%)",
                         zIndex: 2,
                       }}
-                      title="Benchmark 3.5"
+                      title={`Benchmark ${benchmarkScore}`}
                     />
                   </div>
                 </div>
@@ -3721,7 +3969,7 @@ function VisualAnalyticsPage({ liveAssessment }) {
           })}
         </div>
         <div style={{ marginTop: 16, fontSize: 12, color: C.muted }}>
-          Gray vertical tick = benchmark ({BENCHMARK_SCORE}). Bar color reflects Low / Moderate / Advanced band.
+          Gray vertical tick = benchmark ({benchmarkScore}). Bar color reflects Low / Moderate / Advanced band.
         </div>
       </SectionCard>
 
@@ -3734,12 +3982,15 @@ function VisualAnalyticsPage({ liveAssessment }) {
       </SectionCard>
 
       {/* Distribution */}
-      <SectionCard title="Maturity distribution" subtitle="Count of domains by matrix band (Low / Moderate / Advanced).">
+      <SectionCard
+        title="Maturity distribution"
+        subtitle="Count of domains by matrix maturity band (Low / Moderate / Advanced) — same labels as Results matrix."
+      >
         <div style={{ display: "flex", gap: 28, alignItems: "flex-end", justifyContent: "center", padding: "20px 12px 8px" }}>
           {[
-            { key: "Low", count: dist.low, color: "#fecaca", fg: "#991b1b" },
-            { key: "Moderate", count: dist.mod, color: "#fef08a", fg: "#b45309" },
-            { key: "Advanced", count: dist.adv, color: "#86efac", fg: "#15803d" },
+            { key: "Low", count: dist.Low, color: "#fecaca", fg: "#991b1b" },
+            { key: "Moderate", count: dist.Moderate, color: "#fef08a", fg: "#b45309" },
+            { key: "Advanced", count: dist.Advanced, color: "#86efac", fg: "#15803d" },
           ].map((b) => (
             <div key={b.key} style={{ textAlign: "center", width: 120 }}>
               <div style={{ fontSize: 28, fontWeight: 900, color: b.fg }}>{b.count}</div>
@@ -3776,13 +4027,24 @@ function VisualAnalyticsPage({ liveAssessment }) {
   );
 }
 
-function LibraryPageContent({ libraryRefreshTrigger = 0 }) {
+function LibraryPageContent({
+  libraryRefreshTrigger = 0,
+  liveAssessment,
+  clientLabel,
+  onNavigate,
+  benchmarkScore = BENCHMARK_SCORE,
+}) {
   const [memTab, setMemTab] = useState("findings");
   const [search, setSearch] = useState("");
   const [domainFilter, setDomainFilter] = useState("all");
   const [findingsLib, setFindingsLib] = useState([]);
   const [recsLib, setRecsLib] = useState([]);
   const [narsLib, setNarsLib] = useState([]);
+
+  const libraryInsights = useMemo(
+    () => buildWorkspaceLibraryInsights(liveAssessment.entries, { benchmarkScore, limit: 5 }),
+    [liveAssessment, benchmarkScore]
+  );
 
   useEffect(() => {
     setFindingsLib([...readJsonLibrary(LS_FINDINGS_LIBRARY)].reverse());
@@ -3817,6 +4079,166 @@ function LibraryPageContent({ libraryRefreshTrigger = 0 }) {
 
   return (
     <>
+      <SectionCard
+        title="Live workspace (recalculates on every change)"
+        subtitle={`${clientLabel} — mean ${liveAssessment.overallScore}/5, ${liveAssessment.maturityBand}, ${liveAssessment.maturityTier} tier. Same data as Command Center, Results, and export.`}
+      >
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))",
+            gap: 16,
+            marginBottom: 12,
+          }}
+        >
+          {[
+            { k: "Mean score", v: String(liveAssessment.overallScore), hint: "/ 5" },
+            { k: "Weak domains", v: String(liveAssessment.weakCount), hint: "Score ≤2" },
+            { k: "Top gap", v: (liveAssessment.top3 && liveAssessment.top3[0]?.domain) || "—", hint: "Gap-priority order" },
+          ].map((x) => (
+            <div
+              key={x.k}
+              style={{
+                borderRadius: 12,
+                padding: 14,
+                border: `1px solid ${C.border}`,
+                background: "#f8fafc",
+              }}
+            >
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.muted }}>{x.k}</div>
+              <div style={{ fontSize: 22, fontWeight: 900, marginTop: 6, color: C.text }}>
+                {x.v}
+                {x.hint ? (
+                  <span style={{ fontSize: 13, fontWeight: 600, color: C.muted }}> {x.hint}</span>
+                ) : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="Priority insights (from your scores + domain library)"
+        subtitle={
+          libraryInsights.portfolioMean != null
+            ? `Portfolio mean ${libraryInsights.portfolioMean}/5 vs benchmark ${benchmarkScore}. Lowest domains first — gaps and language merge ${clientLabel} notes with TPRM patterns.`
+            : "Complete domain scores to surface prioritized gaps and suggested language."
+        }
+      >
+        {libraryInsights.tierCue ? (
+          <p
+            style={{
+              margin: "0 0 14px",
+              fontSize: 13,
+              lineHeight: 1.55,
+              color: C.text,
+              padding: "12px 14px",
+              borderRadius: 10,
+              background: "#f1f5f9",
+              border: `1px solid ${C.border}`,
+            }}
+          >
+            <strong>Cross-cutting cue ({libraryInsights.tierKey} portfolio).</strong> {libraryInsights.tierCue}
+          </p>
+        ) : null}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+          {[
+            { id: "assessment", label: "Adjust worksheet" },
+            { id: "reviewQueue", label: "Review queue" },
+            { id: "roadmap", label: "Roadmap" },
+            { id: "results", label: "Results & export" },
+          ].map((b) => (
+            <button
+              key={b.id}
+              type="button"
+              onClick={() => onNavigate?.(b.id)}
+              style={{
+                padding: "8px 14px",
+                borderRadius: 10,
+                border: `1px solid ${C.border}`,
+                background: "#fff",
+                fontWeight: 700,
+                fontSize: 12,
+                cursor: onNavigate ? "pointer" : "default",
+                color: C.text,
+                opacity: onNavigate ? 1 : 0.55,
+              }}
+            >
+              {b.label}
+            </button>
+          ))}
+        </div>
+        {libraryInsights.rows.length === 0 ? (
+          <p style={{ margin: 0, fontSize: 13, color: C.muted }}>
+            No domain rows loaded — open Assessment and save scores to populate insights.
+          </p>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            {libraryInsights.rows.map((row) => (
+              <div
+                key={row.domainId}
+                style={{
+                  borderRadius: 12,
+                  padding: 16,
+                  border: `1px solid ${C.border}`,
+                  background: "#fafafa",
+                }}
+              >
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "baseline", marginBottom: 8 }}>
+                  <strong style={{ fontSize: 15 }}>{row.label}</strong>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: C.muted }}>
+                    Score {row.score}/5
+                    <span style={{ marginLeft: 8, color: row.gapToBench < 0 ? "#b91c1c" : "#15803d" }}>
+                      Δ benchmark {row.gapToBench >= 0 ? "+" : ""}
+                      {row.gapToBench}
+                    </span>
+                  </span>
+                </div>
+                {row.evidence ? (
+                  <p style={{ margin: "0 0 10px", fontSize: 13, color: C.text, lineHeight: 1.55 }}>
+                    <strong>Your evidence.</strong> {row.evidence}
+                  </p>
+                ) : null}
+                {row.commonGaps.length > 0 ? (
+                  <div style={{ marginBottom: 10 }}>
+                    <div style={{ fontSize: 10, fontWeight: 800, color: C.accent, letterSpacing: "0.06em", marginBottom: 6 }}>
+                      Common gaps (library)
+                    </div>
+                    <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: C.muted, lineHeight: 1.55 }}>
+                      {row.commonGaps.map((g, i) => (
+                        <li key={i} style={{ marginBottom: 4 }}>
+                          {g}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                {row.templates.length > 0 ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {row.templates.map((t, i) => (
+                      <div
+                        key={i}
+                        style={{
+                          padding: 12,
+                          borderRadius: 10,
+                          borderLeft: `4px solid ${C.accent}`,
+                          background: "#fff",
+                          fontSize: 13,
+                          lineHeight: 1.55,
+                          color: C.text,
+                        }}
+                      >
+                        {t}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        )}
+      </SectionCard>
+
       <section
         style={{
           marginBottom: 24,
@@ -3828,17 +4250,15 @@ function LibraryPageContent({ libraryRefreshTrigger = 0 }) {
         }}
       >
         <p style={{ margin: 0, fontSize: 14, lineHeight: 1.65, color: C.text }}>
-          <strong>Assessment memory.</strong> Each completed run (Generate assessment) appends domain findings, recommendations,
-          and narrative fragments to your browser library.{" "}
-          <strong>This system improves over time as more assessments are completed</strong> — similar maturity and
-          evidence patterns are surfaced automatically when generating executive summaries, risk narratives, and
-          recommendations.
+          <strong>Assessment memory.</strong> Each <strong>Generate assessment</strong> run appends findings,
+          recommendations, and narrative fragments to this browser. Patterns inform future narrative generation—they are{" "}
+          <strong>not</strong> a substitute for the live scores shown above.
         </p>
       </section>
 
       <SectionCard
         title="Reusable memory (this browser)"
-        subtitle="Search and filter items captured from past assessment completions. Keys: findingsLibrary, recommendationsLibrary, narrativesLibrary."
+        subtitle="Search items captured from completed Generate runs (localStorage keys: findingsLibrary, recommendationsLibrary, narrativesLibrary)."
       >
         <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 14, alignItems: "center" }}>
           {[
@@ -3979,129 +4399,15 @@ function LibraryPageContent({ libraryRefreshTrigger = 0 }) {
         )}
       </SectionCard>
 
-      <SectionCard title="Common gaps (reference patterns)" subtitle="Signal phrases frequently echoed in QA, audits, and exams.">
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {[
-            {
-              title: "Golden record fragmentation",
-              body: "Vendor IDs diverge between procurement, legal, and risk systems — residual concentration is opaque.",
-              meta: "Finding pattern",
-            },
-            {
-              title: "Attestation without artifact",
-              body: "Monitoring ‘green’ status lacks contemporaneous evidence packs suitable for challenge.",
-              meta: "Evidence gap",
-            },
-            {
-              title: "Delegated oversight drift",
-              body: "Business-led TP ownership without independent risk challenge on Tier-1 exits.",
-              meta: "Governance",
-            },
-          ].map((c) => (
-            <div
-              key={c.title}
-              style={{
-                borderRadius: 12,
-                padding: 16,
-                border: `1px solid ${C.border}`,
-                background: "#fafafa",
-              }}
-            >
-              <div style={{ fontSize: 10, fontWeight: 800, color: C.accent, letterSpacing: "0.06em", marginBottom: 6 }}>{c.meta}</div>
-              <strong style={{ fontSize: 14 }}>{c.title}</strong>
-              <p style={{ margin: "8px 0 0", fontSize: 13, color: C.muted, lineHeight: 1.55 }}>{c.body}</p>
-            </div>
-          ))}
-        </div>
-      </SectionCard>
-
-      <SectionCard title="Standard recommendation language" subtitle="Committee-ready phrasing — tailor jurisdiction and materiality.">
-        <div style={{ display: "grid", gap: 12 }}>
-          {[
-            "Establish a Tier-0 governance lane with named sponsors, time-bound control uplift targets, and quarterly attestations to the risk committee.",
-            "Embed consolidated concentration metrics (single-counterparty, geography, fourth-party) into monthly MI with breach narratives.",
-            "Where residual risk remains elevated, document compensating controls with expiry and independent validation hooks.",
-          ].map((t, i) => (
-            <div
-              key={i}
-              style={{
-                padding: 16,
-                borderRadius: 12,
-                borderLeft: `4px solid ${C.accent}`,
-                background: C.surface,
-                boxShadow: "0 2px 12px rgba(15,23,42,0.05)",
-                fontSize: 13,
-                lineHeight: 1.6,
-              }}
-            >
-              {t}
-            </div>
-          ))}
-        </div>
-      </SectionCard>
-
-      <SectionCard title="Remediation plays" subtitle="Reusable work packages for digital risk delivery.">
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 14 }}>
-          {[
-            {
-              title: "Critical vendor diligence reset",
-              body: "30/60/90 re-baselining: data room, control testing, contract alignment, and exit readiness for Tier-0.",
-              tag: "Play",
-            },
-            {
-              title: "Monitoring & MI uplift",
-              body: "KRI library, owner matrix, automated triggers, and board-ready MI one-pager template.",
-              tag: "Play",
-            },
-            {
-              title: "Regulatory mapping sprint",
-              body: "Map supervision expectations to control inventory; produce evidence index and gap register.",
-              tag: "Play",
-            },
-          ].map((p) => (
-            <div
-              key={p.title}
-              style={{
-                borderRadius: 14,
-                padding: 18,
-                background: "linear-gradient(180deg,#fff,#f8fafc)",
-                border: `1px solid ${C.border}`,
-                minHeight: 160,
-                display: "flex",
-                flexDirection: "column",
-              }}
-            >
-              <span
-                style={{
-                  alignSelf: "flex-start",
-                  fontSize: 9,
-                  fontWeight: 900,
-                  letterSpacing: "0.1em",
-                  color: C.accent,
-                  background: C.accentSoft,
-                  padding: "4px 8px",
-                  borderRadius: 6,
-                }}
-              >
-                {p.tag}
-              </span>
-              <strong style={{ fontSize: 15, marginTop: 10 }}>{p.title}</strong>
-              <p style={{ margin: "10px 0 0", fontSize: 13, color: C.muted, lineHeight: 1.55, flex: 1 }}>{p.body}</p>
-            </div>
-          ))}
-        </div>
-      </SectionCard>
-
-      <SectionCard title="Evidence examples" subtitle="What “strong” evidence often includes in practice.">
-        <ul style={{ margin: 0, paddingLeft: 20, fontSize: 14, lineHeight: 1.65, color: C.text }}>
-          <li style={{ marginBottom: 10 }}>Diligence pack with third-line review sign-off and issue closure evidence.</li>
-          <li style={{ marginBottom: 10 }}>Control test results mapped to contract clauses and compensating control register.</li>
-          <li style={{ marginBottom: 10 }}>Monitoring logs / tickets showing threshold breach, escalation, and management response.</li>
-        </ul>
-      </SectionCard>
-
-      <SectionCard title="Assessment questions" subtitle="Use in workshops or self-assessments to probe depth.">
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <SectionCard
+        title="Workshop & evidence checklist (generic reference)"
+        subtitle="Optional prompts for QA sessions — use Priority insights above for score-linked gaps and language."
+      >
+        <p style={{ margin: "0 0 12px", fontSize: 13, color: C.muted, lineHeight: 1.55 }}>
+          <strong>Evidence to collect:</strong> diligence pack with challenge-ready artifacts; control tests mapped to clauses;
+          monitoring tickets showing breach, escalation, and management response.
+        </p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {[
             "How is criticality tiering challenged when business disputes materiality classification?",
             "What happens within 24 hours of a KRI breach for a Tier-0 counterparty?",
@@ -4111,12 +4417,12 @@ function LibraryPageContent({ libraryRefreshTrigger = 0 }) {
             <div
               key={i}
               style={{
-                padding: "14px 16px",
+                padding: "12px 14px",
                 borderRadius: 10,
                 background: "#f8fafc",
                 border: `1px solid ${C.border}`,
                 fontSize: 13,
-                fontWeight: 500,
+                lineHeight: 1.5,
               }}
             >
               {q}
@@ -4128,41 +4434,51 @@ function LibraryPageContent({ libraryRefreshTrigger = 0 }) {
   );
 }
 
-function RoadmapPageContent({ liveAssessment }) {
+function RoadmapPageContent({ liveAssessment, demoSamplePackActive, benchmarkScore = BENCHMARK_SCORE }) {
   const sorted = [...liveAssessment.entries].sort((a, b) =>
     a.score !== b.score ? a.score - b.score : a.weighted - b.weighted
   );
   const focusDomains = sorted.slice(0, 3).map((e) => e.label).join(", ") || "priority domains";
+  const midDomains = sorted.slice(3, 6).map((e) => e.label).join(", ");
+  const themeLine =
+    (liveAssessment.themes || []).slice(0, 3).filter(Boolean).join("; ") ||
+    "remediation sequencing tied to current gap order";
+  const belowBench = liveAssessment.entries.filter((e) => e.score < benchmarkScore).length;
+  const criticalN = countCriticalGapEntries(liveAssessment.entries);
+  const topNames = sorted.slice(0, 3).map((e) => e.label);
 
   const columns = [
     {
       title: "30 days",
       focus: `Stabilize weakest lanes: ${focusDomains}`,
       actions: liveAssessment.roadmap.d30,
-      outcome: "Owners named; baseline artifacts and interim policy clarity published.",
+      outcome: `Target ${criticalN} critical-pattern domain(s) and ${liveAssessment.weakCount} score-≤2 lane(s); owners and dates for: ${topNames.join(", ") || "—"}.`,
       tint: "#eff6ff",
     },
     {
       title: "60 days",
-      focus: "Industrialize execution across diligence and monitoring playbooks",
+      focus: midDomains
+        ? `Standardize and scale across next-tier domains: ${midDomains}`
+        : "Extend standardized diligence and monitoring playbooks across remaining domains.",
       actions: liveAssessment.roadmap.d60,
-      outcome: "Standardized packs live; MI cadence and issue SLAs visible to governance.",
+      outcome: `Drive evidence depth for ${belowBench} below-benchmark domain(s) (vs ${benchmarkScore}); embed QA sampling on ${liveAssessment.maturityBand} program controls.`,
       tint: "#f0fdf4",
     },
     {
       title: "90 days",
-      focus: "Assurance, funding lock, and sustained telemetry",
+      focus: `${liveAssessment.maturityBand} program posture · ${liveAssessment.weakCount} weak-domain focus · Themes: ${themeLine}`,
       actions: liveAssessment.roadmap.d90,
-      outcome: "Independent QA sample complete; leadership scorecard and FY roadmap funded.",
+      outcome: `Consolidate mean score ${liveAssessment.overallScore}/5 into leadership MI; close residual gaps from: ${(liveAssessment.themes || []).slice(0, 2).join("; ") || "current theme set"}.`,
       tint: "#fefce8",
     },
   ];
 
   return (
     <>
+      {demoSamplePackActive ? <DemoSamplePackBanner /> : null}
       <SectionCard
         title="Execution roadmap"
-        subtitle={`Prioritized using lowest-scoring domains (current workspace): ${focusDomains}.`}
+        subtitle={`Prioritized using lowest-scoring domains (current workspace): ${focusDomains}. Mean ${liveAssessment.overallScore}/5 · ${belowBench} below benchmark · ${criticalN} critical-pattern domains.`}
       >
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 18 }}>
           {columns.map((col) => (
@@ -4222,7 +4538,10 @@ function RoadmapPageContent({ liveAssessment }) {
 function SettingsPageContent({ profileExtended, domainRows, liveAssessment, assessmentType, aiNarratives }) {
   return (
     <>
-      <SectionCard title="Assessment framework" subtitle="Pinned configuration for repeatable runs (static controls in this build).">
+      <SectionCard
+        title="Assessment framework"
+        subtitle="Version labels for alignment reviews; the active 10-domain scoring model is fixed in this release."
+      >
         <Field label="Active framework">
           <select style={selectStyle} defaultValue="TPRM-CORE-2025-Q2">
             <option value="TPRM-CORE-2025-Q2">TPRM Core · 2025 Q2 (10-domain lifecycle)</option>
@@ -4358,6 +4677,7 @@ export default function App() {
   const [assessmentType, setAssessmentType] = useState(ASSESSMENT_TYPES[0]);
   const [scopeNotes, setScopeNotes] = useState("");
   const [supportingEvidenceText, setSupportingEvidenceText] = useState("");
+  const [uploadedEvidenceFiles, setUploadedEvidenceFiles] = useState([]);
   const [reviewFollowUpByDomain, setReviewFollowUpByDomain] = useState({});
   const [reviewerNotesByDomain, setReviewerNotesByDomain] = useState({});
   /** Command Center: manager sign-off for report readiness (pending | complete | not_required). */
@@ -4371,6 +4691,8 @@ export default function App() {
   /** Populated when user runs Generate assessment (OpenAI or placeholder). */
   const [aiNarratives, setAiNarratives] = useState(null);
   const [narrativeLoading, setNarrativeLoading] = useState(false);
+  /** Fingerprint of workspace when AI evidence analysis last completed — detects stale suggestions after edits. */
+  const [aiAnalysisFingerprint, setAiAnalysisFingerprint] = useState(null);
 
   const completionPct = useMemo(() => {
     let filled = 0;
@@ -4394,7 +4716,11 @@ export default function App() {
     setHasGenerated(true);
     setActivePage("results");
     const assessment = buildAssessment(profileExtended, domainRows);
-    const data = buildAssessmentDataForNarrative(assessment);
+    const data = {
+      ...buildAssessmentDataForNarrative(assessment),
+      supportingEvidenceDigest: String(supportingEvidenceText || ""),
+      uploadedFileCount: uploadedEvidenceFiles.length,
+    };
     setNarrativeLoading(true);
     setAiNarratives(null);
     generateNarrative(data, { profile: profileExtended, domainRows })
@@ -4408,11 +4734,29 @@ export default function App() {
         setMemoryLibraryVersion((v) => v + 1);
       })
       .finally(() => setNarrativeLoading(false));
-  }, [profileExtended, domainRows]);
+  }, [profileExtended, domainRows, supportingEvidenceText, uploadedEvidenceFiles]);
 
   const liveAssessment = useMemo(
     () => buildAssessment(profileExtended, domainRows),
     [profileExtended, domainRows]
+  );
+
+  const showSampleWorkspaceBanner = useMemo(
+    () => workspaceMatchesSamplePack(profile, assessmentType, scopeNotes, supportingEvidenceText, domainRows),
+    [profile, assessmentType, scopeNotes, supportingEvidenceText, domainRows]
+  );
+
+  const hasAiSuggestionPayload = useMemo(
+    () => DOMAINS.some((d) => Boolean(aiSuggestionsByDomain[d.id]?.suggestion)),
+    [aiSuggestionsByDomain]
+  );
+
+  const aiSuggestionsOutOfDate = useMemo(
+    () =>
+      aiAnalysisFingerprint !== null &&
+      hasAiSuggestionPayload &&
+      workspaceAnalysisFingerprint(domainRows, supportingEvidenceText) !== aiAnalysisFingerprint,
+    [aiAnalysisFingerprint, hasAiSuggestionPayload, domainRows, supportingEvidenceText]
   );
 
   const maturityBadgeColor =
@@ -4456,6 +4800,7 @@ export default function App() {
         };
       }
       setAiSuggestionsByDomain(suggestions);
+      setAiAnalysisFingerprint(workspaceAnalysisFingerprint(domainRows, supportingEvidenceText));
       setAnalysisStatus("Suggested");
       setActivePage("assessment");
     } catch (error) {
@@ -4467,33 +4812,43 @@ export default function App() {
   }, [domainRows, profile, assessmentType, supportingEvidenceText]);
 
   const acceptSuggestionForDomain = useCallback((domainId) => {
-    const review = aiSuggestionsByDomain[domainId];
-    if (!review?.suggestion) return;
-    const suggestedScore = clampScore(review.suggestion.suggestedScore);
-    setDomainRows((prev) => ({
-      ...prev,
-      [domainId]: {
-        ...prev[domainId],
-        score: suggestedScore,
-      },
-    }));
-    setAiSuggestionsByDomain((prev) => ({
-      ...prev,
-      [domainId]: {
-        ...prev[domainId],
-        status: "Accepted",
-      },
-    }));
-  }, [aiSuggestionsByDomain]);
+    console.log("[TPRM] Accept suggestion clicked", domainId);
+    setAiSuggestionsByDomain((prevAi) => {
+      const cur = prevAi[domainId];
+      if (!cur?.suggestion) {
+        console.warn("[TPRM] Accept suggestion: no AI payload for domain", domainId);
+        return prevAi;
+      }
+      const suggestedScore = clampScore(cur.suggestion.suggestedScore);
+      Promise.resolve().then(() => {
+        setDomainRows((prevDr) => ({
+          ...prevDr,
+          [domainId]: {
+            ...prevDr[domainId],
+            score: suggestedScore,
+          },
+        }));
+      });
+      return {
+        ...prevAi,
+        [domainId]: { ...cur, status: "Accepted" },
+      };
+    });
+  }, []);
 
   const keepManualScoreForDomain = useCallback((domainId) => {
-    setAiSuggestionsByDomain((prev) => ({
-      ...prev,
-      [domainId]: {
-        ...prev[domainId],
-        status: "Overridden",
-      },
-    }));
+    console.log("[TPRM] Keep manual clicked", domainId);
+    setAiSuggestionsByDomain((prevAi) => {
+      const cur = prevAi[domainId];
+      if (!cur?.suggestion) {
+        console.warn("[TPRM] Keep manual: no AI payload for domain", domainId);
+        return prevAi;
+      }
+      return {
+        ...prevAi,
+        [domainId]: { ...cur, status: "Overridden" },
+      };
+    });
   }, []);
 
   const markReviewFollowUp = useCallback((domainId) => {
@@ -4592,36 +4947,100 @@ export default function App() {
   }, []);
 
   const acceptAllHighConfidenceSuggestions = useCallback(() => {
-    const eligibleIds = DOMAINS.filter((d) => {
-      const review = aiSuggestionsByDomain[d.id];
-      return review?.suggestion?.confidence === "High";
-    }).map((d) => d.id);
-    if (eligibleIds.length === 0) return;
-
-    setDomainRows((prev) => {
-      const next = { ...prev };
-      eligibleIds.forEach((domainId) => {
-        const review = aiSuggestionsByDomain[domainId];
-        next[domainId] = {
-          ...next[domainId],
-          score: clampScore(review.suggestion.suggestedScore),
-        };
+    console.log("[TPRM] Accept all high confidence clicked");
+    setAiSuggestionsByDomain((prevAi) => {
+      const eligible = DOMAINS.filter((d) => prevAi[d.id]?.suggestion?.confidence === "High");
+      if (eligible.length === 0) {
+        flashPersistenceStatus("No high-confidence suggestions to accept.");
+        return prevAi;
+      }
+      const scoreById = {};
+      eligible.forEach((d) => {
+        scoreById[d.id] = clampScore(prevAi[d.id].suggestion.suggestedScore);
       });
-      return next;
-    });
-
-    setAiSuggestionsByDomain((prev) => {
-      const next = { ...prev };
-      eligibleIds.forEach((domainId) => {
-        next[domainId] = {
-          ...next[domainId],
-          status: "Accepted",
-        };
+      Promise.resolve().then(() => {
+        setDomainRows((prevDr) => {
+          const nextDr = { ...prevDr };
+          Object.entries(scoreById).forEach(([id, sc]) => {
+            nextDr[id] = { ...nextDr[id], score: sc };
+          });
+          return nextDr;
+        });
       });
-      return next;
+      const nextAi = { ...prevAi };
+      eligible.forEach((d) => {
+        const cur = nextAi[d.id];
+        if (cur?.suggestion) nextAi[d.id] = { ...cur, status: "Accepted" };
+      });
+      const n = eligible.length;
+      console.log("[TPRM] Accept all high confidence: applied", n, "domain(s)");
+      flashPersistenceStatus(`Accepted ${n} high-confidence suggestion(s).`);
+      setAnalysisStatus(`Accepted ${n} high-confidence`);
+      return nextAi;
     });
-    setAnalysisStatus("Accepted");
-  }, [aiSuggestionsByDomain]);
+  }, [flashPersistenceStatus]);
+
+  const processEvidenceUploads = useCallback(
+    async (fileList) => {
+      if (!fileList?.length) return;
+      const acceptRe = /\.(txt|md|csv|json|pdf|docx)$/i;
+      for (let i = 0; i < fileList.length; i++) {
+        const file = fileList[i];
+        if (!acceptRe.test(file.name)) {
+          flashPersistenceStatus(`Skipped ${file.name} (use .txt, .md, .csv, .json, .pdf, or .docx).`);
+          continue;
+        }
+        const id = `up-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 9)}`;
+        const uploadedAt = new Date().toISOString();
+        const meta = {
+          id,
+          name: file.name,
+          mimeType: file.type || "application/octet-stream",
+          size: file.size,
+          uploadedAt,
+          extractStatus: "evidence_uploaded",
+          appendedSegment: "",
+        };
+        setUploadedEvidenceFiles((prev) => [...prev, meta]);
+        try {
+          const parsed = await parseEvidenceFileToText(file);
+          if (parsed.kind === "failed") {
+            console.error("[TPRM] Extraction failed", file.name, parsed.error);
+            setUploadedEvidenceFiles((prev) =>
+              prev.map((u) => (u.id === id ? { ...u, extractStatus: "extraction_failed", appendedSegment: "" } : u))
+            );
+            flashPersistenceStatus(`Extraction failed for ${file.name} — file kept in list.`);
+            continue;
+          }
+          const segment = buildUploadAppendSegment(file.name, uploadedAt, parsed.text);
+          setSupportingEvidenceText((t) => (t || "") + segment);
+          setUploadedEvidenceFiles((prev) =>
+            prev.map((u) =>
+              u.id === id ? { ...u, extractStatus: "text_extracted", appendedSegment: segment } : u
+            )
+          );
+          console.log("[TPRM] Uploaded files processed", file.name, "text");
+        } catch (e) {
+          console.error("[TPRM] Upload read failed", file.name, e);
+          flashPersistenceStatus(`Could not read ${file.name}: ${e?.message || e}`);
+          setUploadedEvidenceFiles((prev) => prev.filter((u) => u.id !== id));
+        }
+      }
+    },
+    [flashPersistenceStatus]
+  );
+
+  const clearUploadedEvidence = useCallback(() => {
+    setSupportingEvidenceText((t) => {
+      let s = t || "";
+      uploadedEvidenceFiles.forEach((f) => {
+        if (f.appendedSegment) s = s.split(f.appendedSegment).join("");
+      });
+      return s;
+    });
+    setUploadedEvidenceFiles([]);
+    flashPersistenceStatus("Uploaded evidence cleared.");
+  }, [uploadedEvidenceFiles, flashPersistenceStatus]);
 
   const highConfidenceSuggestionCount = useMemo(
     () =>
@@ -4692,6 +5111,8 @@ export default function App() {
           aiSuggestionsByDomain
         ),
         librarySuggestionsByDomain,
+        aiAnalysisFingerprint,
+        uploadedEvidenceFiles,
       };
       localStorage.setItem(TPRM_ASSESSMENT_DRAFT_KEY, JSON.stringify(payload));
       flashPersistenceStatus("Saved successfully");
@@ -4717,6 +5138,8 @@ export default function App() {
     liveAssessment,
     flashPersistenceStatus,
     librarySuggestionsByDomain,
+    aiAnalysisFingerprint,
+    uploadedEvidenceFiles,
   ]);
 
   const loadAssessmentFromLocalStorage = useCallback(() => {
@@ -4727,7 +5150,7 @@ export default function App() {
         return;
       }
       const data = JSON.parse(raw);
-      if (!data || typeof data.v !== "number" || (data.v !== 1 && data.v !== PERSISTENCE_DRAFT_VERSION)) {
+      if (!data || typeof data.v !== "number" || ![1, 2, PERSISTENCE_DRAFT_VERSION].includes(data.v)) {
         flashPersistenceStatus("Invalid or unsupported saved draft.");
         return;
       }
@@ -4739,6 +5162,7 @@ export default function App() {
       setSupportingEvidenceText(
         typeof data.supportingEvidenceText === "string" ? data.supportingEvidenceText : ""
       );
+      setUploadedEvidenceFiles(mergeUploadedEvidenceFiles(data.uploadedEvidenceFiles));
       setDomainRows(mergeLoadedDomainRows(data.domainRows));
       setAiSuggestionsByDomain(mergeLoadedAiSuggestionsByDomain(data.aiSuggestionsByDomain));
       setReviewFollowUpByDomain(mergeLoadedReviewFollowUp(data.reviewFollowUpByDomain));
@@ -4757,6 +5181,9 @@ export default function App() {
         typeof data.reportStatus === "string" ? data.reportStatus : "Report generation ready"
       );
       setLibrarySuggestionsByDomain(mergeLoadedLibrarySuggestions(data.librarySuggestionsByDomain));
+      setAiAnalysisFingerprint(
+        typeof data.aiAnalysisFingerprint === "string" ? data.aiAnalysisFingerprint : null
+      );
       setMemoryLibraryVersion((v) => v + 1);
       flashPersistenceStatus("Loaded successfully");
     } catch (err) {
@@ -4795,6 +5222,8 @@ export default function App() {
     setActivePage("assessment");
     setReportStatus("Report generation ready");
     setLibrarySuggestionsByDomain({});
+    setAiAnalysisFingerprint(null);
+    setUploadedEvidenceFiles([]);
     flashPersistenceStatus("New assessment started");
   }, [flashPersistenceStatus]);
 
@@ -4824,6 +5253,8 @@ export default function App() {
     setLibrarySuggestionsByDomain({});
     setReportStatus("Report generation ready");
     setActivePage("assessment");
+    setAiAnalysisFingerprint(workspaceAnalysisFingerprint(demoRows, DEMO_SUPPORTING_TEXT));
+    setUploadedEvidenceFiles([]);
     flashPersistenceStatus("Demo loaded");
   }, [flashPersistenceStatus]);
 
@@ -4831,10 +5262,15 @@ export default function App() {
     try {
       setReportStatus("Generating report...");
 
+      const clip = (s, n) => {
+        const t = String(s || "");
+        return t.length <= n ? t : `${t.slice(0, n - 1)}…`;
+      };
+
       const pptx = new pptxgen();
       pptx.layout = "LAYOUT_WIDE";
-      pptx.author = "Digital Risk";
-      pptx.title = "TPRM Maturity Assessment Report";
+      pptx.author = clip(reportClientLine(profileExtended), 80);
+      pptx.title = `TPRM Maturity — ${clip(reportClientLine(profileExtended), 60)}`;
 
       /** PptxGenJS expects 6-char hex without '#' */
       const TC = {
@@ -4847,10 +5283,10 @@ export default function App() {
         border: "64748B",
       };
 
-      const clip = (s, n) => {
-        const t = String(s || "");
-        return t.length <= n ? t : `${t.slice(0, n - 1)}…`;
-      };
+      const entriesForExport = Array.isArray(liveAssessment.entries) ? liveAssessment.entries : [];
+      const belowBenchExport = entriesForExport.filter((e) => e.score < BENCHMARK_SCORE).length;
+      const benchGapNum = Number(liveAssessment.overallScore) - BENCHMARK_SCORE;
+      const criticalPatternExport = countCriticalGapEntries(entriesForExport);
 
       const execBody =
         (aiNarratives?.executiveSummary && String(aiNarratives.executiveSummary).trim()) ||
@@ -4915,8 +5351,7 @@ export default function App() {
         ],
       ];
 
-      const rawEntries = Array.isArray(liveAssessment.entries) ? liveAssessment.entries : [];
-      if (rawEntries.length === 0) {
+      if (entriesForExport.length === 0) {
         maturityTableRows.push([
           bodyCell("No domain scores yet — complete the assessment worksheet.", "left"),
           bodyCell("—", "center"),
@@ -4925,7 +5360,7 @@ export default function App() {
           bodyCell("—", "center"),
         ]);
       } else {
-        rawEntries.forEach((e) => {
+        entriesForExport.forEach((e) => {
           const band = matrixMaturityBand(e.score).label;
           const pri = matrixPriority(e.score, e.evidence).label;
           maturityTableRows.push([
@@ -4981,6 +5416,40 @@ export default function App() {
         color: TC.muted,
         fontFace: "Arial",
       });
+      slide1.addText(
+        clip(
+          `Mean ${liveAssessment.overallScore}/5 · ${liveAssessment.maturityBand} (${liveAssessment.maturityTier}) · vs benchmark ${BENCHMARK_SCORE} (${benchGapNum >= 0 ? "+" : ""}${benchGapNum.toFixed(1)}) · ${belowBenchExport} below benchmark · ${criticalPatternExport} critical-pattern domain(s)${
+            uploadedEvidenceFiles.length
+              ? ` · ${uploadedEvidenceFiles.length} uploaded evidence file(s)`
+              : ""
+          }`,
+          240
+        ),
+        {
+          x: 0.5,
+          y: 2.98,
+          w: 12.3,
+          h: 0.45,
+          fontSize: 11,
+          color: TC.muted,
+          fontFace: "Arial",
+        }
+      );
+      if (showSampleWorkspaceBanner) {
+        slide1.addText(
+          "Sample / demo workspace — confirm scores and evidence before external distribution.",
+          {
+            x: 0.5,
+            y: 3.48,
+            w: 12.3,
+            h: 0.32,
+            fontSize: 10,
+            color: TC.sub,
+            fontFace: "Arial",
+            italic: true,
+          }
+        );
+      }
 
       // Slide 2 — Executive Summary
       const slide2 = pptx.addSlide();
@@ -5550,6 +6019,42 @@ export default function App() {
             </div>
           </header>
 
+          {showSampleWorkspaceBanner ? (
+            <div
+              style={{
+                flexShrink: 0,
+                padding: "10px 32px",
+                background: "linear-gradient(90deg, #fffbeb 0%, #fef3c7 100%)",
+                borderBottom: "1px solid #fcd34d",
+                fontSize: 13,
+                color: "#92400e",
+                lineHeight: 1.5,
+              }}
+            >
+              <strong>Sample dataset</strong> — you are using the preloaded assessment from{" "}
+              <strong>Load sample assessment data</strong>. Maturity, matrix, analytics, roadmap, report readiness, and
+              export all <strong>recalculate from your workspace</strong> as you edit fields.
+            </div>
+          ) : null}
+
+          {aiSuggestionsOutOfDate ? (
+            <div
+              style={{
+                flexShrink: 0,
+                padding: "10px 32px",
+                background: "#eff6ff",
+                borderBottom: `1px solid ${C.accent}44`,
+                fontSize: 13,
+                color: C.text,
+                lineHeight: 1.5,
+              }}
+            >
+              <strong>AI suggestions may be out of date</strong> — the worksheet changed after the last evidence analysis.
+              Run <strong>Analyze Evidence &amp; Suggest Scores</strong> in the header to refresh AI columns in the
+              Assessment and Review Queue.
+            </div>
+          ) : null}
+
           {/* Body: workspace + right rail */}
           <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
             {/* Scrollable workspace */}
@@ -5574,6 +6079,8 @@ export default function App() {
                   onAnalyzeEvidence={analyzeEvidenceAndSuggestScores}
                   onAcceptAllHighConfidence={acceptAllHighConfidenceSuggestions}
                   onGenerateReport={generateTPRMReport}
+                  demoSamplePackActive={showSampleWorkspaceBanner}
+                  benchmarkScore={BENCHMARK_SCORE}
                 />
               )}
 
@@ -5723,6 +6230,78 @@ export default function App() {
                     style={{ ...selectStyle, minHeight: 90, lineHeight: 1.5 }}
                   />
                 </Field>
+                <div style={{ marginTop: 16 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: C.text, marginBottom: 8 }}>
+                    Upload supporting evidence
+                  </div>
+                  <p style={{ margin: "0 0 10px", fontSize: 12, color: C.muted, lineHeight: 1.5 }}>
+                    Accepts .txt, .md, .csv, .json, .pdf (full text via pdf.js), and .docx (raw text via mammoth). Extracted
+                    text is appended to supporting evidence above and used for AI analysis, narratives, QA, and export.
+                  </p>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 10 }}>
+                    <input
+                      type="file"
+                      multiple
+                      accept=".txt,.md,.csv,.json,.pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/csv,application/json"
+                      style={{ fontSize: 12, maxWidth: "100%" }}
+                      onChange={(e) => {
+                        const fl = e.target.files;
+                        if (fl?.length) processEvidenceUploads(fl);
+                        e.target.value = "";
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => clearUploadedEvidence()}
+                      disabled={uploadedEvidenceFiles.length === 0}
+                      style={{
+                        padding: "8px 12px",
+                        borderRadius: 8,
+                        border: `1px solid ${C.border}`,
+                        background: uploadedEvidenceFiles.length ? "#fef2f2" : "#f1f5f9",
+                        fontWeight: 700,
+                        fontSize: 12,
+                        cursor: uploadedEvidenceFiles.length ? "pointer" : "not-allowed",
+                        color: uploadedEvidenceFiles.length ? "#991b1b" : C.muted,
+                      }}
+                    >
+                      Clear uploaded evidence
+                    </button>
+                  </div>
+                  {uploadedEvidenceFiles.length > 0 ? (
+                    <ul
+                      style={{
+                        margin: 0,
+                        padding: "10px 12px 10px 22px",
+                        borderRadius: 10,
+                        border: `1px solid ${C.border}`,
+                        background: "#fafafa",
+                        fontSize: 12,
+                        lineHeight: 1.5,
+                        color: C.text,
+                      }}
+                    >
+                      {uploadedEvidenceFiles.map((f) => {
+                        const statusLabel =
+                          f.extractStatus === "extraction_failed"
+                            ? "Extraction failed"
+                            : f.extractStatus === "pdf_docx_pending"
+                              ? "PDF/DOCX extraction pending"
+                              : f.extractStatus === "text_extracted"
+                                ? "Text extracted"
+                                : "Evidence uploaded";
+                        return (
+                          <li key={f.id} style={{ marginBottom: 6 }}>
+                            <strong>{f.name}</strong> · {(f.size / 1024).toFixed(1)} KB ·{" "}
+                            {new Date(f.uploadedAt).toLocaleString()} · <em>{statusLabel}</em>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: 12, color: C.muted }}>No files uploaded in this session.</p>
+                  )}
+                </div>
               </SectionCard>
 
               {/* Domain scoring (includes evidence & notes per domain) */}
@@ -6119,9 +6698,24 @@ export default function App() {
                                     AI suggestion review
                                   </div>
                                   <div style={{ fontSize: 11, color: "#334155" }}>
-                                    Status: <strong>{aiReview?.status || "Suggested"}</strong>
+                                    Status:{" "}
+                                    <strong>
+                                      {aiReview?.status === "Overridden"
+                                        ? "Manual retained"
+                                        : aiReview?.status || "Suggested"}
+                                    </strong>
                                   </div>
                                 </div>
+                                {aiReview?.status === "Overridden" ? (
+                                  <div style={{ fontSize: 12, fontWeight: 700, color: "#047857", marginBottom: 6 }}>
+                                    Manual score retained.
+                                  </div>
+                                ) : null}
+                                {aiReview?.status === "Accepted" ? (
+                                  <div style={{ fontSize: 12, fontWeight: 700, color: "#1d4ed8", marginBottom: 6 }}>
+                                    AI suggestion applied to manual score.
+                                  </div>
+                                ) : null}
                                 <div style={{ fontSize: 12, color: "#1f2937", marginBottom: 6 }}>
                                   Current manual score: <strong>{row.score}</strong> · Suggested score:{" "}
                                   <strong>{aiSuggestion.suggestedScore}</strong>{" "}
@@ -6238,16 +6832,37 @@ export default function App() {
                   reportStatus={reportStatus}
                   reportQualityWarnings={reportQualityWarnings}
                   clientDraft={clientDraft}
+                  demoSamplePackActive={showSampleWorkspaceBanner}
+                  clientLabel={reportClientLine(profileExtended)}
+                  benchmarkScore={BENCHMARK_SCORE}
                 />
               )}
 
-              {activePage === "analytics" && <VisualAnalyticsPage liveAssessment={liveAssessment} />}
-
-              {activePage === "library" && (
-                <LibraryPageContent libraryRefreshTrigger={memoryLibraryVersion} />
+              {activePage === "analytics" && (
+                <VisualAnalyticsPage
+                  liveAssessment={liveAssessment}
+                  demoSamplePackActive={showSampleWorkspaceBanner}
+                  benchmarkScore={BENCHMARK_SCORE}
+                />
               )}
 
-              {activePage === "roadmap" && <RoadmapPageContent liveAssessment={liveAssessment} />}
+              {activePage === "library" && (
+                <LibraryPageContent
+                  libraryRefreshTrigger={memoryLibraryVersion}
+                  liveAssessment={liveAssessment}
+                  clientLabel={reportClientLine(profileExtended)}
+                  onNavigate={setActivePage}
+                  benchmarkScore={BENCHMARK_SCORE}
+                />
+              )}
+
+              {activePage === "roadmap" && (
+                <RoadmapPageContent
+                  liveAssessment={liveAssessment}
+                  demoSamplePackActive={showSampleWorkspaceBanner}
+                  benchmarkScore={BENCHMARK_SCORE}
+                />
+              )}
 
               {activePage === "reviewQueue" && (
                 <ReviewQueuePageContent
@@ -6261,6 +6876,8 @@ export default function App() {
                   onReviewerNoteChange={onReviewerNoteChange}
                   acceptSuggestionForDomain={acceptSuggestionForDomain}
                   keepManualScoreForDomain={keepManualScoreForDomain}
+                  demoSamplePackActive={showSampleWorkspaceBanner}
+                  benchmarkScore={BENCHMARK_SCORE}
                 />
               )}
 
